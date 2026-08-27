@@ -22,6 +22,29 @@ describe("WebSocket server", () => {
     expect(snapshot.payload.entities.players).toHaveLength(1);
     expect(snapshot.payload.entities.bots).toHaveLength(9);
     expect(snapshot.payload.map.base.id).toBe("base");
+    expect(snapshot.payload.leaderboard).toHaveLength(10);
+
+    socket.send(
+      JSON.stringify({ type: "player:lost", payload: { requestId: "lost-network-1", reason: "out-of-fuel" } }),
+    );
+    const despawned = await inbox.next("player:despawned");
+    const lostResult = await inbox.next("game:event-result");
+    expect(despawned.payload.playerId).toBe(welcome.payload.playerId);
+    expect(lostResult.payload).toMatchObject({
+      requestId: "lost-network-1",
+      event: "player-lost",
+      ok: true,
+    });
+
+    socket.send(JSON.stringify({ type: "player:respawn", payload: { requestId: "respawn-network-1" } }));
+    const respawned = await inbox.next("player:respawned");
+    const respawnResult = await inbox.next("game:event-result");
+    expect(respawned.payload.player.status).toBe("active");
+    expect(respawnResult.payload).toMatchObject({
+      requestId: "respawn-network-1",
+      event: "player-respawn",
+      ok: true,
+    });
 
     socket.close();
     await once(socket, "close");

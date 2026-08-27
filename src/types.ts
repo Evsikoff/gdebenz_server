@@ -113,6 +113,8 @@ export interface PlayerInput {
   handbrake: boolean;
 }
 
+export type PlayerStatus = "active" | "lost";
+
 export interface PlayerState extends Point {
   id: string;
   name: string;
@@ -124,6 +126,7 @@ export interface PlayerState extends Point {
   money: number;
   canisters: number;
   filledLiters: number;
+  status: PlayerStatus;
   input: PlayerInput;
   lastInputSeq: number;
   lastMoveAt: number;
@@ -157,6 +160,16 @@ export type BotGoal =
   | { kind: "wander"; x: number; y: number };
 
 export interface PublicPlayerState extends Omit<PlayerState, "input" | "lastMoveAt"> {}
+
+export interface LeaderboardEntry {
+  entityId: string;
+  name: string;
+  liters: number;
+  isPlayer: boolean;
+  color: string;
+  position: number;
+  active: boolean;
+}
 
 export interface EntitySnapshot {
   tick: number;

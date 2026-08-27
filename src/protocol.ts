@@ -1,4 +1,4 @@
-import type { City, EntitySnapshot, PlayerInput, PublicPlayerState } from "./types.js";
+import type { City, EntitySnapshot, LeaderboardEntry, PlayerInput, PublicPlayerState } from "./types.js";
 
 export const PROTOCOL_VERSION = 1 as const;
 
@@ -15,6 +15,26 @@ export type ClientMessage =
       type: "world:interact";
       payload: { requestId: string; objectType: ObjectType; objectId: string; amount?: number };
     }
+  | {
+      type: "player:fuel-filled";
+      payload: { requestId: string; stationId: string; liters: number };
+    }
+  | {
+      type: "station:blocked";
+      payload: { requestId: string; stationId: string };
+    }
+  | {
+      type: "billboard:interacted";
+      payload: { requestId: string; billboardId: string };
+    }
+  | {
+      type: "player:lost";
+      payload: { requestId: string; reason?: string };
+    }
+  | {
+      type: "player:respawn";
+      payload: { requestId: string };
+    }
   | { type: "ping"; payload: { clientTime?: number } };
 
 export type ServerMessage =
@@ -23,7 +43,7 @@ export type ServerMessage =
       payload: { protocolVersion: typeof PROTOCOL_VERSION; tickRate: number; snapshotRate: number };
     }
   | { type: "player:welcome"; payload: { playerId: string; player: PublicPlayerState } }
-  | { type: "world:snapshot"; payload: { map: City; entities: EntitySnapshot } }
+  | { type: "world:snapshot"; payload: { map: City; entities: EntitySnapshot; leaderboard: LeaderboardEntry[] } }
   | {
       type: "world:map-update";
       payload: { map: City; reason: "player-count"; fuelBonus: number; affectedPlayers: string[] };
@@ -32,9 +52,23 @@ export type ServerMessage =
   | { type: "world:objects"; payload: { worldRevision: number; stations: City["stations"]; billboards: City["billboards"]; canisters: City["canisters"] } }
   | { type: "player:joined"; payload: { player: PublicPlayerState; botCount: number } }
   | { type: "player:left"; payload: { playerId: string; botCount: number } }
+  | { type: "player:despawned"; payload: { playerId: string; reason: string } }
+  | { type: "player:respawned"; payload: { player: PublicPlayerState } }
+  | { type: "leaderboard:update"; payload: { rows: LeaderboardEntry[] } }
   | {
       type: "interaction:result";
       payload: { requestId: string; ok: boolean; code: string; player: PublicPlayerState; details?: Record<string, unknown> };
+    }
+  | {
+      type: "game:event-result";
+      payload: {
+        requestId: string;
+        event: "fuel-filled" | "station-blocked" | "billboard-interacted" | "player-lost" | "player-respawn";
+        ok: boolean;
+        code: string;
+        player: PublicPlayerState;
+        details?: Record<string, unknown>;
+      };
     }
   | { type: "server:error"; payload: { code: string; message: string; requestId?: string } }
   | { type: "pong"; payload: { clientTime?: number; serverTime: number } };
@@ -140,6 +174,47 @@ export function parseClientMessage(raw: string): { ok: true; value: ClientMessag
       };
       if (typeof payload.amount === "number") interactionPayload.amount = payload.amount;
       return { ok: true, value: { type: decoded.type, payload: interactionPayload } };
+    }
+    case "player:fuel-filled": {
+      const requestId = requiredString(payload, "requestId", 64);
+      const stationId = requiredString(payload, "stationId", 64);
+      if (!requestId || !stationId || !isFiniteNumber(payload.liters) || payload.liters <= 0) {
+        return { ok: false, error: "Invalid fuel-filled event" };
+      }
+      return {
+        ok: true,
+        value: { type: decoded.type, payload: { requestId, stationId, liters: payload.liters } },
+      };
+    }
+    case "station:blocked": {
+      const requestId = requiredString(payload, "requestId", 64);
+      const stationId = requiredString(payload, "stationId", 64);
+      return requestId && stationId
+        ? { ok: true, value: { type: decoded.type, payload: { requestId, stationId } } }
+        : { ok: false, error: "Invalid station-blocked event" };
+    }
+    case "billboard:interacted": {
+      const requestId = requiredString(payload, "requestId", 64);
+      const billboardId = requiredString(payload, "billboardId", 64);
+      return requestId && billboardId
+        ? { ok: true, value: { type: decoded.type, payload: { requestId, billboardId } } }
+        : { ok: false, error: "Invalid billboard-interacted event" };
+    }
+    case "player:lost": {
+      const requestId = requiredString(payload, "requestId", 64);
+      if (!requestId) return { ok: false, error: "Invalid player-lost event" };
+      if (payload.reason !== undefined && (typeof payload.reason !== "string" || payload.reason.length > 64)) {
+        return { ok: false, error: "Invalid loss reason" };
+      }
+      const lostPayload: Extract<ClientMessage, { type: "player:lost" }>["payload"] = { requestId };
+      if (typeof payload.reason === "string" && payload.reason.trim()) lostPayload.reason = payload.reason.trim();
+      return { ok: true, value: { type: decoded.type, payload: lostPayload } };
+    }
+    case "player:respawn": {
+      const requestId = requiredString(payload, "requestId", 64);
+      return requestId
+        ? { ok: true, value: { type: decoded.type, payload: { requestId } } }
+        : { ok: false, error: "Invalid player-respawn event" };
     }
     case "ping": {
       if (payload.clientTime !== undefined && !isFiniteNumber(payload.clientTime)) {

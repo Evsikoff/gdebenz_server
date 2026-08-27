@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { CONFIG, type GameConfig } from "../src/config.js";
 import { GameRoom } from "../src/game-room.js";
+import { getSpawn } from "../src/world.js";
 
 const smallRoomConfig: GameConfig = {
   ...CONFIG,
@@ -9,6 +10,12 @@ const smallRoomConfig: GameConfig = {
   stationsPerBaseMap: 4,
   canistersPerBaseMap: 4,
   billboardsPerClient: 1,
+};
+
+const eventRoomConfig: GameConfig = {
+  ...smallRoomConfig,
+  botCount: 1,
+  stationLimitChance: 0,
 };
 
 describe("GameRoom", () => {
@@ -117,5 +124,151 @@ describe("GameRoom", () => {
     room.step(1 / CONFIG.snapshotRate);
     expect(messages).toContain("world:entities");
     vi.useRealTimers();
+  });
+
+  it("records filled fuel once and updates the leaderboard", () => {
+    const room = new GameRoom(eventRoomConfig);
+    const player = room.addPlayer("Заправщик");
+    const station = room.city.stations.find((value) => value.state === "active")!;
+    player.x = station.x + station.w / 2;
+    player.y = station.y + station.h / 2;
+    player.fuel = 10;
+    const moneyBefore = player.money;
+
+    const first = room.reportFuelFilled(player.id, "fuel-1", station.id, 5);
+    const duplicate = room.reportFuelFilled(player.id, "fuel-1", station.id, 5);
+
+    expect(first).toEqual(duplicate);
+    expect(first.type === "game:event-result" && first.payload).toMatchObject({
+      event: "fuel-filled",
+      ok: true,
+      code: "accepted",
+      details: { liters: 5, totalLiters: 5 },
+    });
+    expect(player.filledLiters).toBe(5);
+    expect(player.fuel).toBe(15);
+    expect(player.money).toBe(moneyBefore - 5 * station.price);
+    expect(room.leaderboard()[0]).toMatchObject({ entityId: player.id, liters: 5, position: 1, active: true });
+  });
+
+  it("enforces the cumulative station limit for fuel facts", () => {
+    const room = new GameRoom({ ...eventRoomConfig, stationLimitChance: 1, stationFuelLimit: 6 });
+    const player = room.addPlayer("Лимит");
+    const station = room.city.stations.find((value) => value.state === "active")!;
+    player.x = station.x + station.w / 2;
+    player.y = station.y + station.h / 2;
+    player.fuel = 0;
+
+    expect(room.reportStationBlocked(player.id, "lock-limit", station.id).payload.ok).toBe(true);
+    expect(room.reportFuelFilled(player.id, "fuel-limit-1", station.id, 4).payload.ok).toBe(true);
+    const rejected = room.reportFuelFilled(player.id, "fuel-limit-2", station.id, 3);
+
+    expect(rejected.payload).toMatchObject({ ok: false, code: "station-limit-exceeded" });
+    expect(player.filledLiters).toBe(4);
+  });
+
+  it("blocks a station for the offline timeout and activates a different random station", () => {
+    const room = new GameRoom(eventRoomConfig);
+    const player = room.addPlayer("Таймер");
+    const station = room.city.stations.find((value) => value.state === "active")!;
+    player.x = station.x + station.w / 2;
+    player.y = station.y + station.h / 2;
+    player.canisters = 2;
+
+    const result = room.reportStationBlocked(player.id, "lock-1", station.id);
+    expect(result.payload).toMatchObject({
+      event: "station-blocked",
+      ok: true,
+      details: { canisters: 2, unlockIn: 3, chainScheduled: true },
+    });
+    expect(station.state).toBe("locked");
+
+    for (let index = 0; index < 31; index += 1) room.step(0.1);
+    const active = room.city.stations.filter((value) => value.state === "active");
+    expect(active).toHaveLength(1);
+    expect(active[0]!.id).not.toBe(station.id);
+    expect(active[0]!.origin).toBe("timer");
+  });
+
+  it("activates a random station after a billboard fact", () => {
+    const room = new GameRoom(eventRoomConfig);
+    const player = room.addPlayer("Реклама");
+    const station = room.city.stations.find((value) => value.state === "active")!;
+    player.x = station.x + station.w / 2;
+    player.y = station.y + station.h / 2;
+    room.reportStationBlocked(player.id, "lock-ad", station.id);
+    expect(room.city.stations.every((value) => value.state === "locked")).toBe(true);
+
+    const billboard = room.city.billboards[0]!;
+    player.x = billboard.x + billboard.w / 2;
+    player.y = billboard.y + billboard.h / 2;
+    const result = room.reportBillboardInteraction(player.id, "ad-1", billboard.id);
+
+    expect(result.payload).toMatchObject({ event: "billboard-interacted", ok: true, code: "accepted" });
+    expect(billboard.state).toBe("done");
+    expect(room.city.stations.filter((value) => value.state === "active")).toHaveLength(1);
+    expect(room.city.stations.find((value) => value.state === "active")!.origin).toBe("ad");
+  });
+
+  it("despawns a lost player and respawns it at the start with reset resources", () => {
+    const room = new GameRoom(eventRoomConfig);
+    const player = room.addPlayer("Возвращение");
+    player.x += 1_000;
+    player.y += 1_000;
+    player.fuel = 7;
+    player.tankVolume = 80;
+    player.money = 300;
+    player.canisters = 3;
+    player.filledLiters = 12;
+
+    const lost = room.reportPlayerLost(player.id, "lost-1", "out-of-fuel");
+    expect(lost.payload).toMatchObject({ event: "player-lost", ok: true, details: { reason: "out-of-fuel" } });
+    expect(player.status).toBe("lost");
+    expect(room.entitySnapshot().players).toHaveLength(0);
+    expect(room.leaderboard().find((row) => row.entityId === player.id)).toMatchObject({ liters: 12, active: false });
+    expect(
+      room.setInput(player.id, {
+        seq: 1,
+        worldRevision: room.revision,
+        up: true,
+        down: false,
+        left: false,
+        right: false,
+        handbrake: false,
+      }),
+    ).toEqual({ ok: false, code: "player-inactive" });
+
+    const respawn = room.respawnPlayer(player.id, "respawn-1");
+    const spawn = getSpawn(room.city);
+    expect(respawn.payload).toMatchObject({ event: "player-respawn", ok: true, code: "accepted" });
+    expect(player).toMatchObject({
+      status: "active",
+      x: spawn.x,
+      y: spawn.y,
+      angle: spawn.angle,
+      speed: 0,
+      fuel: eventRoomConfig.startFuel,
+      tankVolume: eventRoomConfig.startTankVolume,
+      money: eventRoomConfig.startMoney,
+      canisters: 0,
+      filledLiters: 0,
+    });
+    expect(room.entitySnapshot().players).toHaveLength(1);
+  });
+
+  it("sorts all players and bots by session liters with stable ties", () => {
+    const room = new GameRoom({ ...eventRoomConfig, botCount: 3 });
+    const first = room.addPlayer("Первый");
+    const second = room.addPlayer("Второй");
+    first.filledLiters = 8;
+    second.filledLiters = 12;
+    room.bots[0]!.filledLiters = 8;
+
+    const rows = room.leaderboard();
+    expect(rows.map((row) => [row.name, row.liters, row.position])).toEqual([
+      ["Второй", 12, 1],
+      ["Первый", 8, 2],
+      [room.bots[0]!.name, 8, 3],
+    ]);
   });
 });

@@ -156,6 +156,40 @@ export function createGameServer(options: GameServerOptions = {}): RunningGameSe
           if (error instanceof RoomError) sendError(session, send, error.code, error.message, message.payload.requestId);
           else sendError(session, send, "interaction-failed", "Interaction failed", message.payload.requestId);
         }
+        return;
+      }
+      if (message.type === "player:fuel-filled") {
+        send(
+          session,
+          room.reportFuelFilled(
+            session.playerId,
+            message.payload.requestId,
+            message.payload.stationId,
+            message.payload.liters,
+          ),
+        );
+        return;
+      }
+      if (message.type === "station:blocked") {
+        send(
+          session,
+          room.reportStationBlocked(session.playerId, message.payload.requestId, message.payload.stationId),
+        );
+        return;
+      }
+      if (message.type === "billboard:interacted") {
+        send(
+          session,
+          room.reportBillboardInteraction(session.playerId, message.payload.requestId, message.payload.billboardId),
+        );
+        return;
+      }
+      if (message.type === "player:lost") {
+        send(session, room.reportPlayerLost(session.playerId, message.payload.requestId, message.payload.reason));
+        return;
+      }
+      if (message.type === "player:respawn") {
+        send(session, room.respawnPlayer(session.playerId, message.payload.requestId));
       }
     });
 

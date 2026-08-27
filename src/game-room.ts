@@ -8,6 +8,7 @@ import type {
   BotState,
   City,
   EntitySnapshot,
+  LeaderboardEntry,
   PlayerInput,
   PlayerState,
   PublicPlayerState,
@@ -31,6 +32,20 @@ interface UnlockTask {
   seconds: number;
   fromStationId: string;
 }
+
+interface StationLockResult {
+  locked: boolean;
+  unlockIn: number | null;
+}
+
+interface EventOutcome {
+  ok: boolean;
+  code: string;
+  details?: Record<string, unknown>;
+}
+
+type GameEventName = Extract<ServerMessage, { type: "game:event-result" }>["payload"]["event"];
+type GameEventResult = Extract<ServerMessage, { type: "game:event-result" }>;
 
 export interface InteractionRequest {
   requestId: string;
@@ -65,6 +80,8 @@ export class GameRoom extends EventEmitter {
   private snapshotAccumulator = 0;
   private unlockQueue: UnlockTask[] = [];
   private objectsDirty = false;
+  private readonly eventResults = new Map<string, Map<string, GameEventResult>>();
+  private readonly refuelSessions = new Map<string, { stationId: string; liters: number }>();
 
   constructor(config: GameConfig = CONFIG) {
     super();
@@ -105,6 +122,7 @@ export class GameRoom extends EventEmitter {
       money: this.config.startMoney,
       canisters: 0,
       filledLiters: 0,
+      status: "active",
       input: emptyInput(),
       lastInputSeq: -1,
       lastMoveAt: Date.now(),
@@ -123,13 +141,17 @@ export class GameRoom extends EventEmitter {
       type: "player:joined",
       payload: { player: publicPlayer(player), botCount: this.bots.length },
     });
+    this.emitLeaderboard();
     return player;
   }
 
   removePlayer(playerId: string): boolean {
     if (!this.players.delete(playerId)) return false;
+    this.eventResults.delete(playerId);
+    this.refuelSessions.delete(playerId);
     this.rebalanceForPlayerCount([...this.players.keys()]);
     this.emitMessage({ type: "player:left", payload: { playerId, botCount: this.bots.length } });
+    this.emitLeaderboard();
     return true;
   }
 
@@ -139,6 +161,7 @@ export class GameRoom extends EventEmitter {
   ): MovementResult {
     const player = this.players.get(playerId);
     if (!player) return { ok: false, code: "player-not-found" };
+    if (player.status !== "active") return { ok: false, code: "player-inactive" };
     const validation = this.validateMovementHeader(player, payload.seq, payload.worldRevision);
     if (!validation.ok) return validation;
     player.lastInputSeq = payload.seq;
@@ -162,6 +185,7 @@ export class GameRoom extends EventEmitter {
   ): MovementResult {
     const player = this.players.get(playerId);
     if (!player) return { ok: false, code: "player-not-found" };
+    if (player.status !== "active") return { ok: false, code: "player-inactive" };
     const validation = this.validateMovementHeader(player, payload.seq, payload.worldRevision);
     if (!validation.ok) return validation;
 
@@ -193,6 +217,7 @@ export class GameRoom extends EventEmitter {
       type: "interaction:result",
       payload: { requestId: request.requestId, ok: false, code, player: publicPlayer(player) },
     });
+    if (player.status !== "active") return failure("player-inactive");
 
     let code = "accepted";
     let details: Record<string, unknown> = {};
@@ -209,19 +234,9 @@ export class GameRoom extends EventEmitter {
         break;
       }
       case "billboard": {
-        const billboard = this.city.billboards.find((value) => value.id === request.objectId);
-        if (!billboard) return failure("object-not-found");
-        if (!nearRect(player, billboard, this.config.carRadius + 25)) return failure("too-far");
-        if (billboard.state !== "ready") return failure("billboard-cooldown");
-        const locked = this.city.stations.filter((station) => station.state === "locked");
-        if (locked.length === 0) return failure("all-stations-active");
-        billboard.state = "done";
-        billboard.cooldown = this.config.billboardTimeout;
-        billboard.discovered = true;
-        if (!billboard.discoveredBy.includes(player.id)) billboard.discoveredBy.push(player.id);
-        const unlocked = this.unlockRandomStation("ad");
-        this.objectsDirty = true;
-        details = { stationId: unlocked?.id ?? null, clientId: billboard.client.id };
+        const outcome = this.activateBillboard(player, request.objectId);
+        if (!outcome.ok) return failure(outcome.code);
+        details = outcome.details ?? {};
         break;
       }
       case "station": {
@@ -238,8 +253,9 @@ export class GameRoom extends EventEmitter {
         player.fuel += liters;
         player.money = Math.max(0, player.money - liters * station.price);
         player.filledLiters += liters;
-        this.takeStation(station, player.canisters);
-        details = { liters, spent: liters * station.price, price: station.price };
+        const lock = this.takeStation(station, player.canisters);
+        details = { liters, spent: liters * station.price, price: station.price, unlockIn: lock.unlockIn };
+        this.emitLeaderboard();
         break;
       }
       case "base": {
@@ -268,13 +284,113 @@ export class GameRoom extends EventEmitter {
     return { type: "interaction:result", payload };
   }
 
+  reportFuelFilled(playerId: string, requestId: string, stationId: string, liters: number): GameEventResult {
+    return this.processGameEvent(playerId, requestId, "fuel-filled", (player) => {
+      if (player.status !== "active") return { ok: false, code: "player-inactive" };
+      const station = this.city.stations.find((value) => value.id === stationId);
+      if (!station) return { ok: false, code: "object-not-found" };
+      if (!nearRect(player, station, this.config.carRadius + 40)) return { ok: false, code: "too-far" };
+      if (!Number.isFinite(liters) || liters <= 0 || liters > player.tankVolume) {
+        return { ok: false, code: "invalid-liters" };
+      }
+      const currentSession = this.refuelSessions.get(playerId);
+      const sessionLiters = currentSession?.stationId === stationId ? currentSession.liters : 0;
+      const room = Math.max(0, player.tankVolume - player.fuel);
+      const allowance = station.limit === null ? Number.POSITIVE_INFINITY : Math.max(0, station.limit - sessionLiters);
+      const affordable = station.price > 0 ? player.money / station.price : Number.POSITIVE_INFINITY;
+      if (liters > room + 0.0005) return { ok: false, code: "tank-capacity-exceeded" };
+      if (liters > allowance + 0.0005) {
+        return { ok: false, code: "station-limit-exceeded" };
+      }
+      if (liters > affordable + 0.0005) return { ok: false, code: "not-enough-money" };
+      player.filledLiters += liters;
+      player.fuel += liters;
+      const spent = liters * station.price;
+      player.money = Math.max(0, player.money - spent);
+      this.refuelSessions.set(playerId, { stationId, liters: sessionLiters + liters });
+      this.emitLeaderboard();
+      return {
+        ok: true,
+        code: "accepted",
+        details: { stationId, liters, spent, price: station.price, totalLiters: player.filledLiters, fuel: player.fuel },
+      };
+    });
+  }
+
+  reportStationBlocked(playerId: string, requestId: string, stationId: string): GameEventResult {
+    return this.processGameEvent(playerId, requestId, "station-blocked", (player) => {
+      if (player.status !== "active") return { ok: false, code: "player-inactive" };
+      const station = this.city.stations.find((value) => value.id === stationId);
+      if (!station) return { ok: false, code: "object-not-found" };
+      if (!nearRect(player, station, this.config.carRadius + 40)) return { ok: false, code: "too-far" };
+      if (station.state !== "active") return { ok: false, code: "station-locked" };
+      const result = this.takeStation(station, player.canisters);
+      if (result.locked) this.refuelSessions.set(playerId, { stationId, liters: 0 });
+      return {
+        ok: result.locked,
+        code: result.locked ? "accepted" : "station-locked",
+        details: {
+          stationId,
+          canisters: player.canisters,
+          unlockIn: result.unlockIn,
+          chainScheduled: result.unlockIn !== null,
+        },
+      };
+    });
+  }
+
+  reportBillboardInteraction(playerId: string, requestId: string, billboardId: string): GameEventResult {
+    return this.processGameEvent(playerId, requestId, "billboard-interacted", (player) => {
+      if (player.status !== "active") return { ok: false, code: "player-inactive" };
+      return this.activateBillboard(player, billboardId);
+    });
+  }
+
+  reportPlayerLost(playerId: string, requestId: string, reason = "game-over"): GameEventResult {
+    return this.processGameEvent(playerId, requestId, "player-lost", (player) => {
+      if (player.status === "lost") return { ok: false, code: "already-lost" };
+      player.status = "lost";
+      player.speed = 0;
+      player.input = emptyInput();
+      this.refuelSessions.delete(player.id);
+      this.emitMessage({ type: "player:despawned", payload: { playerId: player.id, reason } });
+      this.emitMessage({ type: "world:entities", payload: this.entitySnapshot() });
+      this.emitLeaderboard();
+      return { ok: true, code: "accepted", details: { reason } };
+    });
+  }
+
+  respawnPlayer(playerId: string, requestId: string): GameEventResult {
+    return this.processGameEvent(playerId, requestId, "player-respawn", (player) => {
+      if (player.status === "active") return { ok: false, code: "player-already-active" };
+      const spawn = getSpawn(this.city);
+      player.x = spawn.x;
+      player.y = spawn.y;
+      player.angle = spawn.angle;
+      player.speed = 0;
+      player.fuel = Math.min(this.config.startFuel, this.config.startTankVolume);
+      player.tankVolume = this.config.startTankVolume;
+      player.money = this.config.startMoney;
+      player.canisters = 0;
+      player.filledLiters = 0;
+      player.status = "active";
+      player.input = emptyInput();
+      player.lastMoveAt = Date.now();
+      this.refuelSessions.delete(player.id);
+      this.emitMessage({ type: "player:respawned", payload: { player: publicPlayer(player) } });
+      this.emitMessage({ type: "world:entities", payload: this.entitySnapshot() });
+      this.emitLeaderboard();
+      return { ok: true, code: "accepted", details: { x: spawn.x, y: spawn.y, angle: spawn.angle } };
+    });
+  }
+
   step(dt: number): void {
     const safeDt = clamp(dt, 0.001, 0.1);
     this.tickNumber += 1;
     this.updateUnlockQueue(safeDt);
     this.updateBillboards(safeDt);
     for (const canister of this.city.canisters) canister.cool = Math.max(0, canister.cool - safeDt);
-    for (const player of this.players.values()) this.stepPlayer(player, safeDt);
+    for (const player of this.players.values()) if (player.status === "active") this.stepPlayer(player, safeDt);
     this.stepBots(safeDt);
 
     if (this.objectsDirty) {
@@ -302,18 +418,105 @@ export class GameRoom extends EventEmitter {
       tick: this.tickNumber,
       serverTime: Date.now(),
       worldRevision: this.worldRevision,
-      players: [...this.players.values()].map(publicPlayer),
+      players: [...this.players.values()].filter((player) => player.status === "active").map(publicPlayer),
       bots: this.bots,
     };
   }
 
   worldSnapshot(): Extract<ServerMessage, { type: "world:snapshot" }> {
-    return { type: "world:snapshot", payload: { map: this.city, entities: this.entitySnapshot() } };
+    return {
+      type: "world:snapshot",
+      payload: { map: this.city, entities: this.entitySnapshot(), leaderboard: this.leaderboard() },
+    };
+  }
+
+  leaderboard(): LeaderboardEntry[] {
+    return [
+      ...[...this.players.values()].map((player, order) => ({
+        entityId: player.id,
+        name: player.name,
+        liters: player.filledLiters,
+        isPlayer: true,
+        color: player.color,
+        active: player.status === "active",
+        order,
+      })),
+      ...this.bots.map((bot, order) => ({
+        entityId: bot.id,
+        name: bot.name,
+        liters: bot.filledLiters,
+        isPlayer: false,
+        color: bot.color,
+        active: true,
+        order: this.players.size + order,
+      })),
+    ]
+      .sort((left, right) => right.liters - left.liters || left.order - right.order)
+      .map(({ order: _order, ...entry }, index) => ({ ...entry, position: index + 1 }));
   }
 
   getPublicPlayer(playerId: string): PublicPlayerState | null {
     const player = this.players.get(playerId);
     return player ? publicPlayer(player) : null;
+  }
+
+  private processGameEvent(
+    playerId: string,
+    requestId: string,
+    event: GameEventName,
+    handler: (player: PlayerState) => EventOutcome,
+  ): GameEventResult {
+    const player = this.players.get(playerId);
+    if (!player) throw new RoomError("player-not-found", "Player is not in the room");
+    let playerResults = this.eventResults.get(playerId);
+    if (!playerResults) {
+      playerResults = new Map();
+      this.eventResults.set(playerId, playerResults);
+    }
+    const cached = playerResults.get(requestId);
+    if (cached) return cached;
+
+    const outcome = handler(player);
+    const payload: GameEventResult["payload"] = {
+      requestId,
+      event,
+      ok: outcome.ok,
+      code: outcome.code,
+      player: publicPlayer(player),
+    };
+    if (outcome.details) payload.details = outcome.details;
+    const result: GameEventResult = { type: "game:event-result", payload };
+    if (playerResults.size >= 256) {
+      const oldest = playerResults.keys().next().value as string | undefined;
+      if (oldest) playerResults.delete(oldest);
+    }
+    playerResults.set(requestId, result);
+    return result;
+  }
+
+  private emitLeaderboard(): void {
+    this.emitMessage({ type: "leaderboard:update", payload: { rows: this.leaderboard() } });
+  }
+
+  private activateBillboard(player: PlayerState, billboardId: string): EventOutcome {
+    const billboard = this.city.billboards.find((value) => value.id === billboardId);
+    if (!billboard) return { ok: false, code: "object-not-found" };
+    if (!nearRect(player, billboard, this.config.carRadius + 25)) return { ok: false, code: "too-far" };
+    if (billboard.state !== "ready") return { ok: false, code: "billboard-cooldown" };
+    if (!this.city.stations.some((station) => station.state === "locked")) {
+      return { ok: false, code: "all-stations-active" };
+    }
+    billboard.state = "done";
+    billboard.cooldown = this.config.billboardTimeout;
+    billboard.discovered = true;
+    if (!billboard.discoveredBy.includes(player.id)) billboard.discoveredBy.push(player.id);
+    const unlocked = this.unlockRandomStation("ad");
+    this.objectsDirty = true;
+    return {
+      ok: true,
+      code: "accepted",
+      details: { stationId: unlocked?.id ?? null, clientId: billboard.client.id },
+    };
   }
 
   private uniqueName(rawName: string): string {
@@ -339,6 +542,7 @@ export class GameRoom extends EventEmitter {
     this.city = buildCity(nextScale, this.worldRevision, this.config);
     initialiseStations(this.city, this.config);
     this.unlockQueue = [];
+    this.refuelSessions.clear();
     const affectedPlayers: string[] = [];
     for (const playerId of fuelBonusPlayerIds) {
       const player = this.players.get(playerId);
@@ -423,6 +627,7 @@ export class GameRoom extends EventEmitter {
   }
 
   private stepBots(dt: number): void {
+    let leaderboardChanged = false;
     for (const bot of this.bots) {
       const result = stepBot(bot, this.city, dt, this.rng, this.config);
       this.resolveBotCollisions(bot);
@@ -431,8 +636,10 @@ export class GameRoom extends EventEmitter {
         const requested = 18 + bot.taken * this.config.canisterTankBonus;
         bot.filledLiters += Math.min(requested, result.station.limit ?? requested);
         this.takeStation(result.station, bot.taken);
+        leaderboardChanged = true;
       }
     }
+    if (leaderboardChanged) this.emitLeaderboard();
   }
 
   private takeCanister(player: PlayerState, canisterId: string): boolean {
@@ -455,16 +662,19 @@ export class GameRoom extends EventEmitter {
     }
   }
 
-  private takeStation(station: Station, canisters: number): void {
-    if (station.state !== "active") return;
+  private takeStation(station: Station, canisters: number): StationLockResult {
+    if (station.state !== "active") return { locked: false, unlockIn: null };
     station.state = "locked";
+    let unlockIn: number | null = null;
     if (station.origin !== "ad") {
+      unlockIn = this.config.stationTimeoutBase + this.config.stationTimeoutPerCanister * canisters;
       this.unlockQueue.push({
-        seconds: this.config.stationTimeoutBase + this.config.stationTimeoutPerCanister * canisters,
+        seconds: unlockIn,
         fromStationId: station.id,
       });
     }
     this.objectsDirty = true;
+    return { locked: true, unlockIn };
   }
 
   private updateUnlockQueue(dt: number): void {
