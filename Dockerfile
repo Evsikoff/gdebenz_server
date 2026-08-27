@@ -14,4 +14,4 @@ COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 USER node
 EXPOSE 8080
-CMD ["node", "dist/index.js"]
+CMD ["node", "dist/src/index.js"]
