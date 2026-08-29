@@ -1,7 +1,7 @@
 import { CONFIG, type GameConfig } from "./config.js";
 import { Random } from "./random.js";
 import type { BotGoal, BotState, Canister, City, Station } from "./types.js";
-import { isInside, nearestRoadCenter } from "./world.js";
+import { getRandomSpawn, isInside, nearestRoadCenter } from "./world.js";
 
 export const BOT_COLORS = [
   "#3f8cff",
@@ -214,32 +214,19 @@ function rollPlan(bot: BotState, rng: Random): void {
   bot.think = 0;
 }
 
-export function createBot(index: number, city: City, occupied: BotState[], rng: Random, config: GameConfig = CONFIG): BotState {
-  const spawn = {
-    x: city.meta.roadWidth / 2 + Math.floor(city.meta.grid / 2) * (city.meta.blockSize + city.meta.roadWidth),
-    y: city.meta.worldSize * 0.62,
-  };
-  let x = spawn.x;
-  let y = spawn.y;
-  let vertical = true;
-  for (let attempt = 0; attempt < 120; attempt += 1) {
-    vertical = rng.bool();
-    const lane = rng.pick(city.roadCenters);
-    const along = city.meta.roadWidth + rng.next() * (city.meta.worldSize - city.meta.roadWidth * 2);
-    x = vertical ? lane : along;
-    y = vertical ? along : lane;
-    if (
-      Math.hypot(x - spawn.x, y - spawn.y) > 700 &&
-      occupied.every((other) => Math.hypot(other.x - x, other.y - y) > 320)
-    ) {
-      break;
-    }
-  }
+export function createBot(
+  index: number,
+  city: City,
+  occupied: readonly { x: number; y: number }[],
+  rng: Random,
+  config: GameConfig = CONFIG,
+): BotState {
+  const spawn = getRandomSpawn(city, rng, occupied);
   const bot: BotState = {
     id: `bot:${index}`,
-    x,
-    y,
-    angle: vertical ? (rng.bool() ? -Math.PI / 2 : Math.PI / 2) : rng.bool() ? 0 : Math.PI,
+    x: spawn.x,
+    y: spawn.y,
+    angle: spawn.angle,
     speed: 0,
     color: BOT_COLORS[index % BOT_COLORS.length]!,
     name: BOT_NAMES[index % BOT_NAMES.length]!,

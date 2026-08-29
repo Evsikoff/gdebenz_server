@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { CONFIG, type GameConfig } from "../src/config.js";
 import { GameRoom } from "../src/game-room.js";
-import { getSpawn } from "../src/world.js";
 
 const smallRoomConfig: GameConfig = {
   ...CONFIG,
@@ -22,10 +21,26 @@ describe("GameRoom", () => {
   it("rebalances bots on join and leave", () => {
     const room = new GameRoom();
     expect(room.botCount).toBe(10);
+    const removedBotSpawn = { x: room.bots.at(-1)!.x, y: room.bots.at(-1)!.y };
     const player = room.addPlayer("Ева");
     expect(room.botCount).toBe(9);
     room.removePlayer(player.id);
     expect(room.botCount).toBe(10);
+    expect({ x: room.bots.at(-1)!.x, y: room.bots.at(-1)!.y }).not.toEqual(removedBotSpawn);
+  });
+
+  it("spawns players at different random road locations", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 10 });
+    const players = [room.addPlayer("Первый"), room.addPlayer("Второй"), room.addPlayer("Третий")];
+
+    expect(new Set(players.map((player) => `${player.x}:${player.y}`)).size).toBe(players.length);
+    for (const player of players) {
+      expect(
+        room.city.roadCenters.some(
+          (roadCenter) => Math.abs(player.x - roadCenter) < 0.001 || Math.abs(player.y - roadCenter) < 0.001,
+        ),
+      ).toBe(true);
+    }
   });
 
   it("updates existing players, the map and fuel at the scaling threshold", () => {
@@ -210,9 +225,10 @@ describe("GameRoom", () => {
     expect(room.city.stations.find((value) => value.state === "active")!.origin).toBe("ad");
   });
 
-  it("despawns a lost player and respawns it at the start with reset resources", () => {
+  it("despawns a lost player and respawns it at a new random road location with reset resources", () => {
     const room = new GameRoom(eventRoomConfig);
     const player = room.addPlayer("Возвращение");
+    const initialSpawn = { x: player.x, y: player.y, angle: player.angle };
     player.x += 1_000;
     player.y += 1_000;
     player.fuel = 7;
@@ -239,13 +255,9 @@ describe("GameRoom", () => {
     ).toEqual({ ok: false, code: "player-inactive" });
 
     const respawn = room.respawnPlayer(player.id, "respawn-1");
-    const spawn = getSpawn(room.city);
     expect(respawn.payload).toMatchObject({ event: "player-respawn", ok: true, code: "accepted" });
     expect(player).toMatchObject({
       status: "active",
-      x: spawn.x,
-      y: spawn.y,
-      angle: spawn.angle,
       speed: 0,
       fuel: eventRoomConfig.startFuel,
       tankVolume: eventRoomConfig.startTankVolume,
@@ -253,6 +265,12 @@ describe("GameRoom", () => {
       canisters: 0,
       filledLiters: 0,
     });
+    expect({ x: player.x, y: player.y, angle: player.angle }).not.toEqual(initialSpawn);
+    expect(
+      room.city.roadCenters.some(
+        (roadCenter) => Math.abs(player.x - roadCenter) < 0.001 || Math.abs(player.y - roadCenter) < 0.001,
+      ),
+    ).toBe(true);
     expect(room.entitySnapshot().players).toHaveLength(1);
   });
 

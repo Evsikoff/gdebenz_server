@@ -67,6 +67,33 @@ export function getSpawn(city: City): { x: number; y: number; angle: number } {
   return { x, y: city.meta.worldSize * 0.62, angle: -Math.PI / 2 };
 }
 
+/** Выбирает случайную точку на дороге, по возможности подальше от других машин. */
+export function getRandomSpawn(
+  city: City,
+  rng: Random,
+  occupied: readonly { x: number; y: number }[] = [],
+  minDistance = 320,
+): { x: number; y: number; angle: number } {
+  let spawn = getSpawn(city);
+
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    const vertical = rng.bool();
+    const lane = rng.pick(city.roadCenters);
+    const along = city.meta.roadWidth + rng.next() * (city.meta.worldSize - city.meta.roadWidth * 2);
+    spawn = {
+      x: vertical ? lane : along,
+      y: vertical ? along : lane,
+      angle: vertical ? (rng.bool() ? -Math.PI / 2 : Math.PI / 2) : rng.bool() ? 0 : Math.PI,
+    };
+
+    if (occupied.every((other) => Math.hypot(other.x - spawn.x, other.y - spawn.y) >= minDistance)) {
+      break;
+    }
+  }
+
+  return spawn;
+}
+
 /**
  * Детерминированная карта в формате клиентского City. Масштаб означает
  * увеличение каждой стороны; площадь и число объектов растут как scale².

@@ -15,7 +15,7 @@ import type {
   Rect,
   Station,
 } from "./types.js";
-import { buildCity, getSpawn, initialiseStations, isInside } from "./world.js";
+import { buildCity, getRandomSpawn, initialiseStations, isInside } from "./world.js";
 
 const PLAYER_COLORS = [
   "#e5472f",
@@ -107,7 +107,7 @@ export class GameRoom extends EventEmitter {
   addPlayer(rawName: string): PlayerState {
     if (this.players.size >= this.config.maxPlayers) throw new RoomError("room-full", "The room is full");
     const existingPlayerIds = [...this.players.keys()];
-    const spawn = getSpawn(this.city);
+    const spawn = this.randomSpawn();
     const id = randomUUID();
     const player: PlayerState = {
       id,
@@ -131,7 +131,7 @@ export class GameRoom extends EventEmitter {
 
     const mapChanged = this.rebalanceForPlayerCount(existingPlayerIds);
     if (mapChanged) {
-      const newSpawn = getSpawn(this.city);
+      const newSpawn = this.randomSpawn(player.id);
       player.x = newSpawn.x;
       player.y = newSpawn.y;
       player.angle = newSpawn.angle;
@@ -363,7 +363,7 @@ export class GameRoom extends EventEmitter {
   respawnPlayer(playerId: string, requestId: string): GameEventResult {
     return this.processGameEvent(playerId, requestId, "player-respawn", (player) => {
       if (player.status === "active") return { ok: false, code: "player-already-active" };
-      const spawn = getSpawn(this.city);
+      const spawn = this.randomSpawn();
       player.x = spawn.x;
       player.y = spawn.y;
       player.angle = spawn.angle;
@@ -575,8 +575,22 @@ export class GameRoom extends EventEmitter {
     const target = botCountForPlayers(this.players.size, this.config);
     if (this.bots.length > target) this.bots.splice(target);
     while (this.bots.length < target) {
-      this.bots.push(createBot(this.bots.length, this.city, this.bots, this.rng, this.config));
+      const occupied = [
+        ...this.bots,
+        ...[...this.players.values()].filter((player) => player.status === "active"),
+      ];
+      this.bots.push(createBot(this.bots.length, this.city, occupied, this.rng, this.config));
     }
+  }
+
+  private randomSpawn(excludePlayerId?: string): { x: number; y: number; angle: number } {
+    const occupied = [
+      ...this.bots,
+      ...[...this.players.values()].filter(
+        (player) => player.status === "active" && player.id !== excludePlayerId,
+      ),
+    ];
+    return getRandomSpawn(this.city, this.rng, occupied);
   }
 
   private validateMovementHeader(player: PlayerState, seq: number, worldRevision: number): MovementResult {
