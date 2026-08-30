@@ -38,7 +38,6 @@ export interface BotStep {
 const LANE_EPS = 60;
 const FINAL_DIST = 190;
 const DETOUR = 260;
-const REFUEL_SECONDS = 2.4;
 const SELL_SECONDS = 2;
 const SELL_FROM = 2;
 const THINK_SECONDS = 0.25;
@@ -318,7 +317,10 @@ export function stepBot(
   } else if (goal.kind === "station") {
     const station = city.stations.find((value) => value.id === goal.id);
     if (station?.state === "active" && isInside(bot, station)) {
-      bot.wait = REFUEL_SECONDS;
+      bot.wait = Math.max(
+        0,
+        config.stationTimeoutBase + config.stationTimeoutPerCanister * Math.max(0, bot.taken),
+      );
       bot.refuelled = true;
       bot.goal = null;
       bot.think = 0;

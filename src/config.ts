@@ -39,7 +39,6 @@ export interface GameConfig {
   carRadius: number;
   canisterRadius: number;
   canisterTankBonus: number;
-  refuelRate: number;
   tickRate: number;
   snapshotRate: number;
   maxPlayers: number;
@@ -49,6 +48,8 @@ export interface GameConfig {
 export const CONFIG: Readonly<GameConfig> = Object.freeze({
   botCount: 10,
   fuelBurnPerSecond: 0.57,
+  // Полное время обслуживания: base + perCanister * число канистр.
+  // За этот интервал бак плавно заполняется до доступного уровня.
   stationTimeoutBase: 1,
   stationTimeoutPerCanister: 1,
   billboardTimeout: 20,
@@ -78,7 +79,6 @@ export const CONFIG: Readonly<GameConfig> = Object.freeze({
   carRadius: 15,
   canisterRadius: 20,
   canisterTankBonus: 10,
-  refuelRate: 10,
   tickRate: 30,
   snapshotRate: 10,
   maxPlayers: 200,

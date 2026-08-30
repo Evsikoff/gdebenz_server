@@ -103,7 +103,16 @@ describe("GameRoom", () => {
       amount: 5,
     });
     expect(stationResult.type === "interaction:result" && stationResult.payload.ok).toBe(true);
-    expect(player.fuel).toBe(45);
+    expect(player.fuel).toBe(40);
+    expect(
+      stationResult.type === "interaction:result" && stationResult.payload.details,
+    ).toMatchObject({
+      scheduled: true,
+      serviceTime: CONFIG.stationTimeoutBase + CONFIG.stationTimeoutPerCanister * player.canisters,
+    });
+    room.step(1 / CONFIG.tickRate);
+    expect(player.fuel).toBeGreaterThan(40);
+    expect(player.refueling).toBe(true);
     expect(station.state).toBe("locked");
 
     const billboard = room.city.billboards[0]!;
@@ -420,6 +429,29 @@ describe("GameRoom", () => {
     expect(Math.hypot(second.kx, second.ky)).toBeGreaterThan(0);
   });
 
+  it("не пропускает столкновение при длинном серверном тике", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 0 });
+    const first = room.addPlayer("Первый");
+    const second = room.addPlayer("Второй");
+    const messages: unknown[] = [];
+    room.on("message", (message) => messages.push(message));
+
+    first.x = 1_000;
+    first.y = 1_000;
+    first.angle = 0;
+    first.speed = 640;
+    second.x = 1_050;
+    second.y = 1_000;
+    second.angle = Math.PI;
+    second.speed = 640;
+
+    // Без подшагов машины за 100 мс успевают поменяться местами и оказываются
+    // снова дальше суммы радиусов, поэтому простая дискретная проверка их теряет.
+    room.step(0.1);
+
+    expect(messages.some((message) => (message as { type: string }).type === "world:collisions")).toBe(true);
+  });
+
   it("выбивает канистры из протаранённого игрока и возвращает объём бака", () => {
     const room = new GameRoom({ ...smallRoomConfig, botCount: 2 });
     const first = room.addPlayer("Первый");
@@ -450,13 +482,21 @@ describe("GameRoom", () => {
     expect(canister.taken).toBe(false);
   });
 
-  it("заправляет постепенно, а не мгновенно", () => {
-    const room = new GameRoom({ ...smallRoomConfig, botCount: 0 });
+  it("заправляет постепенно за время на машину плюс время на канистры", () => {
+    const config = {
+      ...smallRoomConfig,
+      botCount: 0,
+      stationTimeoutBase: 1.2,
+      stationTimeoutPerCanister: 0.7,
+    };
+    const room = new GameRoom(config);
     const player = room.addPlayer("Заправщик");
     const station = room.city.stations.find((value) => value.state === "active")!;
     station.limit = null;
     station.price = 100;
     player.money = 1_000_000;
+    player.canisters = 2;
+    player.tankVolume = config.startTankVolume + config.canisterTankBonus * player.canisters;
     player.fuel = 0.5;
     player.x = station.x + station.w / 2;
     player.y = station.y + station.h / 2;
@@ -465,9 +505,9 @@ describe("GameRoom", () => {
     room.step(1 / 30);
     const afterFirstTick = player.fuel;
 
-    // за один тик наливается не больше refuelRate * dt
+    // Первый тик только начинает плавное заполнение — мгновенного полного бака нет.
     expect(afterFirstTick).toBeGreaterThan(0.5);
-    expect(afterFirstTick - 0.5).toBeLessThanOrEqual(CONFIG.refuelRate / 30 + 0.001);
+    expect(afterFirstTick).toBeLessThan(player.tankVolume);
     expect(player.refueling).toBe(true);
     expect(player.refuelStationId).toBe(station.id);
     // колонка блокируется сразу, как только к ней встали
@@ -475,16 +515,44 @@ describe("GameRoom", () => {
     // под колонкой машина стоит
     expect(player.speed).toBe(0);
 
-    // полный бак набирается примерно за tankVolume / refuelRate секунд
+    // Полный бак набирается за точный таймаут из конфигурации.
     let ticks = 1;
     while (player.refueling && ticks < 30 * 60) {
       room.step(1 / 30);
       ticks += 1;
     }
-    const expectedTicks = ((player.tankVolume - 0.5) / CONFIG.refuelRate) * 30;
-    expect(ticks).toBeGreaterThan(expectedTicks * 0.9);
+    const expectedTicks =
+      (config.stationTimeoutBase + config.stationTimeoutPerCanister * player.canisters) * config.tickRate;
+    expect(ticks).toBeGreaterThanOrEqual(expectedTicks - 1);
+    expect(ticks).toBeLessThanOrEqual(expectedTicks + 1);
     expect(player.fuel).toBeCloseTo(player.tankVolume, 3);
     expect(player.refuelSpent).toBeCloseTo(player.refuelLiters * station.price, 3);
+  });
+
+  it("считает заправляющуюся машину неподвижной стенкой при таране", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 0, stationTimeoutBase: 2 });
+    const parked = room.addPlayer("На колонке");
+    const rammer = room.addPlayer("Таран");
+    const station = room.city.stations.find((value) => value.state === "active")!;
+    station.limit = null;
+    parked.fuel = 10;
+    parked.x = station.x + station.w / 2;
+    parked.y = station.y + station.h / 2;
+    room.step(1 / 30);
+    expect(parked.refueling).toBe(true);
+    expect(station.state).toBe("locked");
+
+    const position = { x: parked.x, y: parked.y };
+    rammer.x = parked.x - 30;
+    rammer.y = parked.y;
+    rammer.angle = 0;
+    rammer.speed = 500;
+    room.step(1 / 30);
+
+    expect({ x: parked.x, y: parked.y }).toEqual(position);
+    expect(parked.kx).toBe(0);
+    expect(parked.ky).toBe(0);
+    expect(rammer.speed).toBeLessThan(500);
   });
 
   it("останавливает заправку на лимите колонки", () => {

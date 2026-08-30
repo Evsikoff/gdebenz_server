@@ -62,6 +62,14 @@ interface UnlockTask {
   fromStationId: string;
 }
 
+interface RefuelPlan {
+  stationId: string;
+  targetLiters: number;
+  duration: number;
+  elapsed: number;
+  reason: Exclude<RefuelEvent["reason"], "left" | null>;
+}
+
 interface StationLockResult {
   locked: boolean;
   unlockIn: number | null;
@@ -111,6 +119,7 @@ export class GameRoom extends EventEmitter {
   private objectsDirty = false;
   private readonly eventResults = new Map<string, Map<string, GameEventResult>>();
   private readonly refuelSessions = new Map<string, { stationId: string; liters: number }>();
+  private readonly refuelPlans = new Map<string, RefuelPlan>();
   private collisionEvents: CollisionEvent[] = [];
 
   constructor(config: GameConfig = CONFIG) {
@@ -188,6 +197,7 @@ export class GameRoom extends EventEmitter {
     if (!this.players.delete(playerId)) return false;
     this.eventResults.delete(playerId);
     this.refuelSessions.delete(playerId);
+    this.refuelPlans.delete(playerId);
     this.rebalanceForPlayerCount([...this.players.keys()]);
     this.emitMessage({ type: "player:left", payload: { playerId, botCount: this.bots.length } });
     this.emitLeaderboard();
@@ -296,22 +306,20 @@ export class GameRoom extends EventEmitter {
           };
           break;
         }
-        // Ниже — совместимость со старыми клиентами, которые заправлялись одним
-        // запросом. Актуальный клиент этого не шлёт: заправку ведёт сервер
-        // постепенно в updateRefuelling().
+        // Старый клиент присылал один запрос и получал весь объём мгновенно.
+        // Теперь запрос лишь подтверждает постановку в очередь: саму заправку
+        // следующий тик запускает через общий таймер updateRefuelling().
         if (station.state !== "active") return failure("station-locked");
         const room = Math.max(0, player.tankVolume - player.fuel);
-        const requested = request.amount ?? room;
         const allowance = station.limit ?? Number.POSITIVE_INFINITY;
         const affordable = station.price > 0 ? player.money / station.price : Number.POSITIVE_INFINITY;
-        const liters = Math.max(0, Math.min(requested, room, allowance, affordable));
+        const liters = Math.max(0, Math.min(request.amount ?? room, room, allowance, affordable));
         if (liters <= 0.0005) return failure(room <= 0.0005 ? "tank-full" : "not-enough-money");
-        player.fuel += liters;
-        player.money = Math.max(0, player.money - liters * station.price);
-        player.filledLiters += liters;
-        const lock = this.takeStation(station, player.canisters);
-        details = { liters, spent: liters * station.price, price: station.price, unlockIn: lock.unlockIn };
-        this.emitLeaderboard();
+        details = {
+          scheduled: true,
+          price: station.price,
+          serviceTime: this.refuelDuration(player.canisters),
+        };
         break;
       }
       case "base": {
@@ -409,6 +417,7 @@ export class GameRoom extends EventEmitter {
       player.speed = 0;
       player.input = emptyInput();
       this.refuelSessions.delete(player.id);
+      this.refuelPlans.delete(player.id);
       this.emitMessage({ type: "player:despawned", payload: { playerId: player.id, reason } });
       this.emitMessage({ type: "world:entities", payload: this.entitySnapshot() });
       this.emitLeaderboard();
@@ -476,6 +485,7 @@ export class GameRoom extends EventEmitter {
       player.speedMultiplier = 1;
       player.fuelConsumptionMultiplier = 1;
       this.refuelSessions.delete(player.id);
+      this.refuelPlans.delete(player.id);
       this.emitMessage({ type: "player:respawned", payload: { player: publicPlayer(player) } });
       this.emitMessage({ type: "world:entities", payload: this.entitySnapshot() });
       this.emitLeaderboard();
@@ -486,12 +496,19 @@ export class GameRoom extends EventEmitter {
   step(dt: number): void {
     const safeDt = clamp(dt, 0.001, 0.1);
     this.tickNumber += 1;
-    this.updateUnlockQueue(safeDt);
-    this.updateBillboards(safeDt);
-    for (const canister of this.city.canisters) canister.cool = Math.max(0, canister.cool - safeDt);
-    for (const player of this.players.values()) if (player.status === "active") this.stepPlayer(player, safeDt);
-    this.stepBots(safeDt);
-    this.carCollisions();
+    // При задержке event loop один серверный тик может быть заметно длиннее
+    // обычного. Делим его на шаги не больше клиентских 33 мс, чтобы быстрые
+    // машины не успевали проскочить друг сквозь друга между проверками.
+    const substeps = Math.max(1, Math.ceil(safeDt / (1 / 30)));
+    const stepDt = safeDt / substeps;
+    for (let index = 0; index < substeps; index += 1) {
+      this.updateUnlockQueue(stepDt);
+      this.updateBillboards(stepDt);
+      for (const canister of this.city.canisters) canister.cool = Math.max(0, canister.cool - stepDt);
+      for (const player of this.players.values()) if (player.status === "active") this.stepPlayer(player, stepDt);
+      this.stepBots(stepDt);
+      this.carCollisions();
+    }
 
     if (this.objectsDirty) {
       this.objectsDirty = false;
@@ -654,6 +671,7 @@ export class GameRoom extends EventEmitter {
     initialiseStations(this.city, this.config);
     this.unlockQueue = [];
     this.refuelSessions.clear();
+    this.refuelPlans.clear();
     const affectedPlayers: string[] = [];
     for (const playerId of fuelBonusPlayerIds) {
       const player = this.players.get(playerId);
@@ -663,6 +681,11 @@ export class GameRoom extends EventEmitter {
       affectedPlayers.push(player.id);
     }
     for (const player of this.players.values()) {
+      player.refueling = false;
+      player.refuelStationId = null;
+      player.refuelLiters = 0;
+      player.refuelSpent = 0;
+      player.usedStationId = null;
       player.x = clamp(player.x, this.config.carRadius + 20, this.city.meta.worldSize - this.config.carRadius - 20);
       player.y = clamp(player.y, this.config.carRadius + 20, this.city.meta.worldSize - this.config.carRadius - 20);
       player.lastMoveAt = Date.now();
@@ -768,97 +791,118 @@ export class GameRoom extends EventEmitter {
     return this.config.maxSpeed * player.speedMultiplier;
   }
 
+  private refuelDuration(canisters: number): number {
+    return Math.max(
+      0,
+      this.config.stationTimeoutBase + this.config.stationTimeoutPerCanister * Math.max(0, canisters),
+    );
+  }
+
   /**
-   * Заправка — порт updateFuel() из офлайн-движка клиента. Топливо льётся по
-   * refuelRate литров в секунду, пока машина стоит на площадке работающей АЗС.
-   * Начатую сессию доводим до полного бака, а колонку блокируем сразу, как
-   * только к ней встали. Останавливают заправку три вещи: полный бак, лимит
-   * колонки и деньги в кармане — что первым закончится.
+   * Заправка — порт updateFuel() из офлайн-движка клиента. Доступный объём
+   * плавно наливается за T = base + perCanister * canisters. Колонку блокируем
+   * сразу, а полный бак, лимит или деньги определяют целевой объём сессии.
    */
   private updateRefuelling(player: PlayerState, dt: number): void {
     const station = this.stationUnderPlayer(player);
-    // повторно вставать под ту же колонку, не съехав с площадки, нельзя:
-    // иначе долитый до полного бак сразу тратит пару капель и заправка
-    // начинается заново, а машина остаётся заблокированной навсегда
-    const canStart = !!station && station.state === "active" && station.id !== player.usedStationId;
-    const canContinue = !!station && station.id === player.refuelStationId;
-
-    let step = 0;
-    let stop: RefuelEvent["reason"] = null;
-    if (station && (canStart || canContinue)) {
-      const poured = canContinue ? player.refuelLiters : 0;
-      const room = player.tankVolume - player.fuel;
-      const allowance = station.limit === null ? Number.POSITIVE_INFINITY : Math.max(0, station.limit - poured);
-      const affordable = station.price > 0 ? player.money / station.price : Number.POSITIVE_INFINITY;
-      step = Math.min(this.config.refuelRate * dt, room, allowance, affordable);
-      if (step <= 0.0005) stop = room <= 0.05 ? "full" : allowance <= 0.0005 ? "limit" : "money";
-    }
-
-    if (station && (canStart || canContinue) && step > 0.0005) {
-      if (!player.refueling) {
-        // машина встала под колонку — колонка занята
-        player.refueling = true;
-        player.refuelStationId = station.id;
-        player.refuelLiters = 0;
-        player.refuelSpent = 0;
-        player.speed = 0;
-        player.kx = 0;
-        player.ky = 0;
-        this.takeStation(station, player.canisters);
-        this.emitMessage({
-          type: "player:refuel",
-          payload: {
-            playerId: player.id,
-            stationId: station.id,
-            state: "started",
-            reason: null,
-            liters: 0,
-            spent: 0,
-          },
-        });
-      }
-      const before = player.fuel;
-      player.fuel = Math.min(player.tankVolume, player.fuel + step);
-      const filled = player.fuel - before;
-      const paid = filled * station.price;
-      player.money = Math.max(0, player.money - paid);
-      player.filledLiters += filled;
-      player.refuelLiters += filled;
-      player.refuelSpent += paid;
-      if (filled > 0) this.emitLeaderboard();
-      return;
-    }
 
     if (!player.refueling) {
-      // простой заезд на площадку с полным баком тоже помечает её использованной,
-      // иначе заправка начнётся сама, стоит потратить пару капель
-      if (!station) player.usedStationId = null;
-      else if (station.state === "active" && station.id !== player.usedStationId && step <= 0.0005) {
-        player.usedStationId = station.id;
+      if (!station) {
+        player.usedStationId = null;
+        return;
       }
-      return;
-    }
+      // Повторно вставать под ту же колонку, не съехав с площадки, нельзя.
+      if (station.state !== "active" || station.id === player.usedStationId) return;
 
-    // заправка закончилась
-    const finishedStationId = player.refuelStationId;
-    const liters = player.refuelLiters;
-    const spent = player.refuelSpent;
-    player.refueling = false;
-    player.refuelStationId = null;
-    player.usedStationId = finishedStationId;
-    if (finishedStationId) {
+      const room = player.tankVolume - player.fuel;
+      const allowance = station.limit === null ? Number.POSITIVE_INFINITY : Math.max(0, station.limit);
+      const affordable = station.price > 0 ? player.money / station.price : Number.POSITIVE_INFINITY;
+      const targetLiters = Math.max(0, Math.min(room, allowance, affordable));
+      if (targetLiters <= 0.0005) {
+        player.usedStationId = station.id;
+        return;
+      }
+
+      const plan: RefuelPlan = {
+        stationId: station.id,
+        targetLiters,
+        duration: this.refuelDuration(player.canisters),
+        elapsed: 0,
+        reason: room <= targetLiters + 0.0005 ? "full" : allowance <= targetLiters + 0.0005 ? "limit" : "money",
+      };
+      this.refuelPlans.set(player.id, plan);
+      player.refueling = true;
+      player.refuelStationId = station.id;
+      player.refuelLiters = 0;
+      player.refuelSpent = 0;
+      player.speed = 0;
+      player.kx = 0;
+      player.ky = 0;
+      this.takeStation(station, player.canisters);
       this.emitMessage({
         type: "player:refuel",
         payload: {
           playerId: player.id,
-          stationId: finishedStationId,
-          state: "stopped",
-          reason: stop ?? "left",
-          liters,
-          spent,
+          stationId: station.id,
+          state: "started",
+          reason: null,
+          liters: 0,
+          spent: 0,
         },
       });
     }
+
+    const plan = this.refuelPlans.get(player.id);
+    if (!plan || !station || station.id !== plan.stationId) {
+      this.finishRefuelling(player, "left");
+      return;
+    }
+
+    const nextElapsed = plan.duration <= 0 ? plan.duration : Math.min(plan.duration, plan.elapsed + dt);
+    const desiredLiters =
+      plan.duration <= 0 ? plan.targetLiters : plan.targetLiters * (nextElapsed / plan.duration);
+    const step = Math.max(0, Math.min(plan.targetLiters - player.refuelLiters, desiredLiters - player.refuelLiters));
+    plan.elapsed = nextElapsed;
+
+    const before = player.fuel;
+    player.fuel = Math.min(player.tankVolume, player.fuel + step);
+    const filled = player.fuel - before;
+    const paid = filled * station.price;
+    player.money = Math.max(0, player.money - paid);
+    player.filledLiters += filled;
+    player.refuelLiters += filled;
+    player.refuelSpent += paid;
+    if (filled > 0) this.emitLeaderboard();
+
+    if (
+      player.refuelLiters >= plan.targetLiters - 0.0005 ||
+      plan.duration <= 0 ||
+      plan.elapsed >= plan.duration
+    ) {
+      this.finishRefuelling(player, plan.reason);
+    }
+  }
+
+  private finishRefuelling(player: PlayerState, reason: RefuelEvent["reason"]): void {
+    const finishedStationId = player.refuelStationId;
+    const liters = player.refuelLiters;
+    const spent = player.refuelSpent;
+    this.refuelPlans.delete(player.id);
+    player.refueling = false;
+    player.refuelStationId = null;
+    player.usedStationId = finishedStationId;
+    if (!finishedStationId) return;
+    this.emitMessage({
+      type: "player:refuel",
+      payload: {
+        playerId: player.id,
+        stationId: finishedStationId,
+        state: "stopped",
+        reason,
+        liters,
+        spent,
+      },
+    });
   }
 
   /** Площадка АЗС, на которой сейчас стоит машина. Отступ тот же, что в офлайне. */
@@ -987,7 +1031,7 @@ export class GameRoom extends EventEmitter {
     station.state = "locked";
     let unlockIn: number | null = null;
     if (station.origin !== "ad") {
-      unlockIn = this.config.stationTimeoutBase + this.config.stationTimeoutPerCanister * canisters;
+      unlockIn = this.refuelDuration(canisters);
       this.unlockQueue.push({
         seconds: unlockIn,
         fromStationId: station.id,
@@ -1072,7 +1116,10 @@ export class GameRoom extends EventEmitter {
         y: player.y,
         vx: Math.cos(player.angle) * player.speed + player.kx,
         vy: Math.sin(player.angle) * player.speed + player.ky,
-        fixed: this.isAtActiveStation(player),
+        // updateRefuelling() сразу переводит занятую станцию в locked, поэтому
+        // проверка station.state === active ошибочно делала заправляющуюся
+        // машину подвижной. Источник правды здесь — сама сессия игрока.
+        fixed: player.refueling,
         player,
         bot: null,
       });
@@ -1232,14 +1279,6 @@ export class GameRoom extends EventEmitter {
       if (!blocked) return { x: px, y: py };
     }
     return { x: clamp(x, 40, worldSize - 40), y: clamp(y, 40, worldSize - 40) };
-  }
-
-  /** Игрок стоит на площадке работающей АЗС — считаем его неподвижной стенкой. */
-  private isAtActiveStation(player: PlayerState): boolean {
-    if (Math.abs(player.speed) > 30) return false;
-    return this.city.stations.some(
-      (station) => station.state === "active" && isInside(player, station),
-    );
   }
 
   private resolvePlayerCollisions(player: PlayerState): void {
