@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { botCountForPlayers, CONFIG, mapScaleForPlayers, type GameConfig } from "./config.js";
 import { applyKnock, createBot, stepBot } from "./bots.js";
 import type { ObjectType, ServerMessage } from "./protocol.js";
+import { messageForCode } from "./messages.js";
 import { Random } from "./random.js";
 import type {
   BotState,
@@ -144,7 +145,7 @@ export class GameRoom extends EventEmitter {
   }
 
   addPlayer(rawName: string): PlayerState {
-    if (this.players.size >= this.config.maxPlayers) throw new RoomError("room-full", "The room is full");
+    if (this.players.size >= this.config.maxPlayers) throw new RoomError("room-full", messageForCode("room-full"));
     const existingPlayerIds = [...this.players.keys()];
     const spawn = this.randomSpawn();
     const id = randomUUID();
@@ -171,6 +172,8 @@ export class GameRoom extends EventEmitter {
       refuelStationId: null,
       refuelLiters: 0,
       refuelSpent: 0,
+      refuelDuration: 0,
+      refuelRemaining: 0,
       usedStationId: null,
       speedMultiplier: 1,
       fuelConsumptionMultiplier: 1,
@@ -260,11 +263,11 @@ export class GameRoom extends EventEmitter {
   interact(playerId: string, request: InteractionRequest): ServerMessage {
     const player = this.players.get(playerId);
     if (!player) {
-      throw new RoomError("player-not-found", "Player is not in the room");
+      throw new RoomError("player-not-found", messageForCode("player-not-found"));
     }
     const failure = (code: string): ServerMessage => ({
       type: "interaction:result",
-      payload: { requestId: request.requestId, ok: false, code, player: publicPlayer(player) },
+      payload: { requestId: request.requestId, ok: false, code, message: messageForCode(code), player: publicPlayer(player) },
     });
     if (player.status !== "active") return failure("player-inactive");
 
@@ -342,6 +345,7 @@ export class GameRoom extends EventEmitter {
       requestId: request.requestId,
       ok: code === "accepted",
       code,
+      message: messageForCode(code),
       player: publicPlayer(player),
     };
     if (Object.keys(details).length > 0) payload.details = details;
@@ -416,6 +420,10 @@ export class GameRoom extends EventEmitter {
       player.status = "lost";
       player.speed = 0;
       player.input = emptyInput();
+      player.refueling = false;
+      player.refuelStationId = null;
+      player.refuelDuration = 0;
+      player.refuelRemaining = 0;
       this.refuelSessions.delete(player.id);
       this.refuelPlans.delete(player.id);
       this.emitMessage({ type: "player:despawned", payload: { playerId: player.id, reason } });
@@ -481,6 +489,8 @@ export class GameRoom extends EventEmitter {
       player.refuelStationId = null;
       player.refuelLiters = 0;
       player.refuelSpent = 0;
+      player.refuelDuration = 0;
+      player.refuelRemaining = 0;
       player.usedStationId = null;
       player.speedMultiplier = 1;
       player.fuelConsumptionMultiplier = 1;
@@ -595,7 +605,7 @@ export class GameRoom extends EventEmitter {
     handler: (player: PlayerState) => EventOutcome,
   ): GameEventResult {
     const player = this.players.get(playerId);
-    if (!player) throw new RoomError("player-not-found", "Player is not in the room");
+    if (!player) throw new RoomError("player-not-found", messageForCode("player-not-found"));
     let playerResults = this.eventResults.get(playerId);
     if (!playerResults) {
       playerResults = new Map();
@@ -610,6 +620,7 @@ export class GameRoom extends EventEmitter {
       event,
       ok: outcome.ok,
       code: outcome.code,
+      message: messageForCode(outcome.code),
       player: publicPlayer(player),
     };
     if (outcome.details) payload.details = outcome.details;
@@ -685,6 +696,8 @@ export class GameRoom extends EventEmitter {
       player.refuelStationId = null;
       player.refuelLiters = 0;
       player.refuelSpent = 0;
+      player.refuelDuration = 0;
+      player.refuelRemaining = 0;
       player.usedStationId = null;
       player.x = clamp(player.x, this.config.carRadius + 20, this.city.meta.worldSize - this.config.carRadius - 20);
       player.y = clamp(player.y, this.config.carRadius + 20, this.city.meta.worldSize - this.config.carRadius - 20);
@@ -835,6 +848,8 @@ export class GameRoom extends EventEmitter {
       player.refuelStationId = station.id;
       player.refuelLiters = 0;
       player.refuelSpent = 0;
+      player.refuelDuration = plan.duration;
+      player.refuelRemaining = plan.duration;
       player.speed = 0;
       player.kx = 0;
       player.ky = 0;
@@ -863,6 +878,7 @@ export class GameRoom extends EventEmitter {
       plan.duration <= 0 ? plan.targetLiters : plan.targetLiters * (nextElapsed / plan.duration);
     const step = Math.max(0, Math.min(plan.targetLiters - player.refuelLiters, desiredLiters - player.refuelLiters));
     plan.elapsed = nextElapsed;
+    player.refuelRemaining = Math.max(0, plan.duration - plan.elapsed);
 
     const before = player.fuel;
     player.fuel = Math.min(player.tankVolume, player.fuel + step);
@@ -890,6 +906,8 @@ export class GameRoom extends EventEmitter {
     this.refuelPlans.delete(player.id);
     player.refueling = false;
     player.refuelStationId = null;
+    player.refuelDuration = 0;
+    player.refuelRemaining = 0;
     player.usedStationId = finishedStationId;
     if (!finishedStationId) return;
     this.emitMessage({

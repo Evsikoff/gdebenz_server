@@ -21,6 +21,12 @@ describe("WebSocket protocol validation", () => {
     expect(parseClientMessage(JSON.stringify({ type: "hack", payload: {} })).ok).toBe(false);
   });
 
+  it("returns validation messages in Russian", () => {
+    const result = parseClientMessage("not-json");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/[А-Яа-яЁё]/);
+  });
+
   it.each([
     [
       { type: "player:fuel-filled", payload: { requestId: "fuel-1", stationId: "station:1", liters: 4.5 } },

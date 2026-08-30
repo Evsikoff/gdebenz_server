@@ -510,6 +510,16 @@ describe("GameRoom", () => {
     expect(afterFirstTick).toBeLessThan(player.tankVolume);
     expect(player.refueling).toBe(true);
     expect(player.refuelStationId).toBe(station.id);
+    expect(player.refuelDuration).toBeCloseTo(2.6, 5);
+    expect(player.refuelRemaining).toBeLessThan(player.refuelDuration);
+    expect(player.refuelRemaining).toBeGreaterThan(0);
+    expect(room.entitySnapshot().players.find((value) => value.id === player.id)).toMatchObject({
+      canisters: 2,
+      refueling: true,
+      refuelStationId: station.id,
+      refuelDuration: player.refuelDuration,
+      refuelRemaining: player.refuelRemaining,
+    });
     // колонка блокируется сразу, как только к ней встали
     expect(station.state).toBe("locked");
     // под колонкой машина стоит
@@ -527,6 +537,24 @@ describe("GameRoom", () => {
     expect(ticks).toBeLessThanOrEqual(expectedTicks + 1);
     expect(player.fuel).toBeCloseTo(player.tankVolume, 3);
     expect(player.refuelSpent).toBeCloseTo(player.refuelLiters * station.price, 3);
+    expect(player.refuelDuration).toBe(0);
+    expect(player.refuelRemaining).toBe(0);
+  });
+
+  it("adds a Russian message to rejected interactions", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 0 });
+    const player = room.addPlayer("Сообщения");
+    const result = room.interact(player.id, {
+      requestId: "missing-object",
+      objectType: "canister",
+      objectId: "canister:missing",
+    });
+
+    expect(result.type).toBe("interaction:result");
+    if (result.type === "interaction:result") {
+      expect(result.payload).toMatchObject({ ok: false, code: "object-not-found" });
+      expect(result.payload.message).toMatch(/[А-Яа-яЁё]/);
+    }
   });
 
   it("считает заправляющуюся машину неподвижной стенкой при таране", () => {

@@ -1,0 +1,35 @@
+const RUSSIAN_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
+  accepted: "Действие выполнено.",
+  "room-full": "Комната заполнена.",
+  "player-not-found": "Игрок не найден.",
+  "player-inactive": "Игрок сейчас не участвует в заезде.",
+  "player-already-active": "Игрок уже участвует в заезде.",
+  "already-lost": "Заезд этого игрока уже завершён.",
+  "object-not-found": "Игровой объект не найден.",
+  "unsupported-object": "Это действие не поддерживается.",
+  "canister-taken": "Эту канистру уже подобрали.",
+  "too-far": "Нужно подъехать ближе.",
+  "station-locked": "Эта заправка сейчас закрыта.",
+  "tank-full": "Бак уже полон.",
+  "not-enough-money": "Недостаточно денег.",
+  "nothing-to-sell": "Нет топлива для продажи.",
+  "invalid-liters": "Указан некорректный объём топлива.",
+  "tank-capacity-exceeded": "Указанный объём не помещается в бак.",
+  "station-limit-exceeded": "Превышен лимит отпуска этой колонки.",
+  "billboard-cooldown": "Этот рекламный щит ещё недоступен.",
+  "all-stations-active": "Все заправки уже работают.",
+  "unknown-booster": "Игровой эффект этого улучшения не настроен.",
+  "stale-world": "Карта обновилась — повторите действие.",
+  "stale-sequence": "Получена устаревшая команда управления.",
+  "movement-too-fast": "Сервер отклонил слишком резкое перемещение.",
+  "binary-not-supported": "Поддерживаются только текстовые JSON-сообщения.",
+  "invalid-message": "Сервер получил некорректное сообщение.",
+  "already-joined": "Это подключение уже участвует в заезде.",
+  "join-failed": "Не удалось присоединиться к заезду.",
+  "join-required": "Сначала нужно присоединиться к заезду.",
+  "interaction-failed": "Не удалось выполнить игровое действие.",
+});
+
+export function messageForCode(code: string): string {
+  return RUSSIAN_MESSAGES[code] ?? `Сервер отклонил запрос (${code}).`;
+}

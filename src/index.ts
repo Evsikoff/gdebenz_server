@@ -10,13 +10,13 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS ?? "*")
 
 const gameServer = createGameServer({ host, port, allowedOrigins });
 const address = await gameServer.start();
-console.log(`gdebenz-server listening on ws://${address.host}:${address.port}/ws`);
+console.log(`gdebenz-server принимает подключения на ws://${address.host}:${address.port}/ws`);
 
 let stopping = false;
 const shutdown = async (signal: string): Promise<void> => {
   if (stopping) return;
   stopping = true;
-  console.log(`Received ${signal}; shutting down`);
+  console.log(`Получен сигнал ${signal}; сервер завершает работу`);
   await gameServer.stop();
   process.exit(0);
 };

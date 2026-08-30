@@ -71,7 +71,7 @@ export type ServerMessage =
   | { type: "leaderboard:update"; payload: { rows: LeaderboardEntry[] } }
   | {
       type: "interaction:result";
-      payload: { requestId: string; ok: boolean; code: string; player: PublicPlayerState; details?: Record<string, unknown> };
+      payload: { requestId: string; ok: boolean; code: string; message: string; player: PublicPlayerState; details?: Record<string, unknown> };
     }
   | {
       type: "game:event-result";
@@ -86,6 +86,7 @@ export type ServerMessage =
           | "booster-applied";
         ok: boolean;
         code: string;
+        message: string;
         player: PublicPlayerState;
         details?: Record<string, unknown>;
       };
@@ -111,17 +112,17 @@ export function parseClientMessage(raw: string): { ok: true; value: ClientMessag
   try {
     decoded = JSON.parse(raw) as unknown;
   } catch {
-    return { ok: false, error: "Message is not valid JSON" };
+    return { ok: false, error: "Сообщение не является корректным JSON." };
   }
   if (!isRecord(decoded) || typeof decoded.type !== "string" || !isRecord(decoded.payload)) {
-    return { ok: false, error: "Message must contain string type and object payload" };
+    return { ok: false, error: "Сообщение должно содержать строковое поле type и объект payload." };
   }
   const payload = decoded.payload;
 
   switch (decoded.type) {
     case "player:join": {
       const name = requiredString(payload, "name", 24);
-      return name ? { ok: true, value: { type: decoded.type, payload: { name } } } : { ok: false, error: "Invalid player name" };
+      return name ? { ok: true, value: { type: decoded.type, payload: { name } } } : { ok: false, error: "Некорректное имя игрока." };
     }
     case "player:input": {
       if (
@@ -133,7 +134,7 @@ export function parseClientMessage(raw: string): { ok: true; value: ClientMessag
         typeof payload.right !== "boolean" ||
         typeof payload.handbrake !== "boolean"
       ) {
-        return { ok: false, error: "Invalid player input" };
+        return { ok: false, error: "Некорректная команда управления игроком." };
       }
       return {
         ok: true,
@@ -160,7 +161,7 @@ export function parseClientMessage(raw: string): { ok: true; value: ClientMessag
         !isFiniteNumber(payload.angle) ||
         !isFiniteNumber(payload.speed)
       ) {
-        return { ok: false, error: "Invalid player movement" };
+        return { ok: false, error: "Некорректные координаты перемещения игрока." };
       }
       return {
         ok: true,
@@ -182,10 +183,10 @@ export function parseClientMessage(raw: string): { ok: true; value: ClientMessag
       const objectId = requiredString(payload, "objectId", 64);
       const allowedTypes: ObjectType[] = ["billboard", "station", "canister", "base"];
       if (!requestId || !objectId || !allowedTypes.includes(payload.objectType as ObjectType)) {
-        return { ok: false, error: "Invalid interaction" };
+        return { ok: false, error: "Некорректный запрос взаимодействия." };
       }
       if (payload.amount !== undefined && (!isFiniteNumber(payload.amount) || payload.amount < 0)) {
-        return { ok: false, error: "Invalid interaction amount" };
+        return { ok: false, error: "Некорректное количество в запросе взаимодействия." };
       }
       const interactionPayload: Extract<ClientMessage, { type: "world:interact" }>["payload"] = {
         requestId,
@@ -199,7 +200,7 @@ export function parseClientMessage(raw: string): { ok: true; value: ClientMessag
       const requestId = requiredString(payload, "requestId", 64);
       const stationId = requiredString(payload, "stationId", 64);
       if (!requestId || !stationId || !isFiniteNumber(payload.liters) || payload.liters <= 0) {
-        return { ok: false, error: "Invalid fuel-filled event" };
+        return { ok: false, error: "Некорректное событие заправки." };
       }
       return {
         ok: true,
@@ -211,23 +212,23 @@ export function parseClientMessage(raw: string): { ok: true; value: ClientMessag
       const stationId = requiredString(payload, "stationId", 64);
       return requestId && stationId
         ? { ok: true, value: { type: decoded.type, payload: { requestId, stationId } } }
-        : { ok: false, error: "Invalid station-blocked event" };
+        : { ok: false, error: "Некорректное событие блокировки заправки." };
     }
     case "billboard:interacted": {
       const requestId = requiredString(payload, "requestId", 64);
       const billboardId = requiredString(payload, "billboardId", 64);
       return requestId && billboardId
         ? { ok: true, value: { type: decoded.type, payload: { requestId, billboardId } } }
-        : { ok: false, error: "Invalid billboard-interacted event" };
+        : { ok: false, error: "Некорректное событие рекламного щита." };
     }
     case "player:booster": {
       const requestId = requiredString(payload, "requestId", 64);
       const systemName = requiredString(payload, "systemName", 64);
       if (!requestId || !systemName || !/^[a-z0-9_.]+$/i.test(systemName)) {
-        return { ok: false, error: "Invalid booster event" };
+        return { ok: false, error: "Некорректное событие улучшения." };
       }
       if (payload.cost !== undefined && (!isFiniteNumber(payload.cost) || payload.cost < 0)) {
-        return { ok: false, error: "Invalid booster cost" };
+        return { ok: false, error: "Некорректная стоимость улучшения." };
       }
       const boosterPayload: Extract<ClientMessage, { type: "player:booster" }>["payload"] = {
         requestId,
@@ -238,9 +239,9 @@ export function parseClientMessage(raw: string): { ok: true; value: ClientMessag
     }
     case "player:lost": {
       const requestId = requiredString(payload, "requestId", 64);
-      if (!requestId) return { ok: false, error: "Invalid player-lost event" };
+      if (!requestId) return { ok: false, error: "Некорректное событие завершения заезда." };
       if (payload.reason !== undefined && (typeof payload.reason !== "string" || payload.reason.length > 64)) {
-        return { ok: false, error: "Invalid loss reason" };
+        return { ok: false, error: "Некорректная причина завершения заезда." };
       }
       const lostPayload: Extract<ClientMessage, { type: "player:lost" }>["payload"] = { requestId };
       if (typeof payload.reason === "string" && payload.reason.trim()) lostPayload.reason = payload.reason.trim();
@@ -250,11 +251,11 @@ export function parseClientMessage(raw: string): { ok: true; value: ClientMessag
       const requestId = requiredString(payload, "requestId", 64);
       return requestId
         ? { ok: true, value: { type: decoded.type, payload: { requestId } } }
-        : { ok: false, error: "Invalid player-respawn event" };
+        : { ok: false, error: "Некорректное событие возвращения игрока." };
     }
     case "ping": {
       if (payload.clientTime !== undefined && !isFiniteNumber(payload.clientTime)) {
-        return { ok: false, error: "Invalid client time" };
+        return { ok: false, error: "Некорректное время клиента." };
       }
       return {
         ok: true,
@@ -265,6 +266,6 @@ export function parseClientMessage(raw: string): { ok: true; value: ClientMessag
       };
     }
     default:
-      return { ok: false, error: `Unknown message type: ${decoded.type}` };
+      return { ok: false, error: `Неизвестный тип сообщения: ${decoded.type}` };
   }
 }

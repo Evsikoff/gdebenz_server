@@ -2,6 +2,7 @@ import { createServer, type Server as HttpServer } from "node:http";
 import { WebSocket, WebSocketServer } from "ws";
 import { CONFIG, type GameConfig } from "./config.js";
 import { GameRoom, RoomError } from "./game-room.js";
+import { messageForCode } from "./messages.js";
 import { parseClientMessage, PROTOCOL_VERSION, type ServerMessage } from "./protocol.js";
 
 interface ClientSession {
@@ -60,7 +61,7 @@ export function createGameServer(options: GameServerOptions = {}): RunningGameSe
       return;
     }
     response.writeHead(404);
-    response.end(JSON.stringify({ error: "not-found" }));
+    response.end(JSON.stringify({ error: "Страница не найдена." }));
   });
 
   const websocketServer = new WebSocketServer({
@@ -69,7 +70,7 @@ export function createGameServer(options: GameServerOptions = {}): RunningGameSe
     maxPayload: config.maxClientMessageBytes,
     verifyClient: ({ origin }, done) => {
       const accepted = allowedOrigins.includes("*") || !origin || allowedOrigins.includes(origin);
-      done(accepted, accepted ? 200 : 403, accepted ? "OK" : "Origin is not allowed");
+      done(accepted, accepted ? 200 : 403, accepted ? "OK" : "Источник подключения не разрешён");
     },
   });
 
@@ -100,7 +101,7 @@ export function createGameServer(options: GameServerOptions = {}): RunningGameSe
 
     socket.on("message", (raw, isBinary) => {
       if (isBinary) {
-        sendError(session, send, "binary-not-supported", "Only JSON text messages are accepted");
+        sendError(session, send, "binary-not-supported", messageForCode("binary-not-supported"));
         return;
       }
       const parsed = parseClientMessage(raw.toString());
@@ -119,7 +120,7 @@ export function createGameServer(options: GameServerOptions = {}): RunningGameSe
 
       if (message.type === "player:join") {
         if (session.playerId) {
-          sendError(session, send, "already-joined", "This connection already has a player");
+          sendError(session, send, "already-joined", messageForCode("already-joined"));
           return;
         }
         try {
@@ -129,24 +130,24 @@ export function createGameServer(options: GameServerOptions = {}): RunningGameSe
           send(session, room.worldSnapshot());
         } catch (error) {
           if (error instanceof RoomError) sendError(session, send, error.code, error.message);
-          else sendError(session, send, "join-failed", "Could not join the room");
+          else sendError(session, send, "join-failed", messageForCode("join-failed"));
         }
         return;
       }
 
       if (!session.playerId) {
-        sendError(session, send, "join-required", "Send player:join before gameplay messages");
+        sendError(session, send, "join-required", messageForCode("join-required"));
         return;
       }
 
       if (message.type === "player:input") {
         const result = room.setInput(session.playerId, message.payload);
-        if (!result.ok) sendError(session, send, result.code, "Player input was rejected");
+        if (!result.ok) sendError(session, send, result.code, messageForCode(result.code));
         return;
       }
       if (message.type === "player:move") {
         const result = room.applyClientMove(session.playerId, message.payload);
-        if (!result.ok) sendError(session, send, result.code, "Player movement was rejected");
+        if (!result.ok) sendError(session, send, result.code, messageForCode(result.code));
         return;
       }
       if (message.type === "world:interact") {
@@ -154,7 +155,7 @@ export function createGameServer(options: GameServerOptions = {}): RunningGameSe
           send(session, room.interact(session.playerId, message.payload));
         } catch (error) {
           if (error instanceof RoomError) sendError(session, send, error.code, error.message, message.payload.requestId);
-          else sendError(session, send, "interaction-failed", "Interaction failed", message.payload.requestId);
+          else sendError(session, send, "interaction-failed", messageForCode("interaction-failed"), message.payload.requestId);
         }
         return;
       }
