@@ -1,4 +1,4 @@
-import type { City, EntitySnapshot, LeaderboardEntry, PlayerInput, PublicPlayerState } from "./types.js";
+import type { City, CollisionEvent, EntitySnapshot, LeaderboardEntry, PlayerInput, PublicPlayerState } from "./types.js";
 
 export const PROTOCOL_VERSION = 1 as const;
 
@@ -49,6 +49,7 @@ export type ServerMessage =
       payload: { map: City; reason: "player-count"; fuelBonus: number; affectedPlayers: string[] };
     }
   | { type: "world:entities"; payload: EntitySnapshot }
+  | { type: "world:collisions"; payload: { tick: number; collisions: CollisionEvent[] } }
   | { type: "world:objects"; payload: { worldRevision: number; stations: City["stations"]; billboards: City["billboards"]; canisters: City["canisters"] } }
   | { type: "player:joined"; payload: { player: PublicPlayerState; botCount: number } }
   | { type: "player:left"; payload: { playerId: string; botCount: number } }

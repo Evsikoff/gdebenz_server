@@ -1,12 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { botCountForPlayers, CONFIG, mapScaleForPlayers, type GameConfig } from "./config.js";
-import { createBot, stepBot } from "./bots.js";
+import { applyKnock, createBot, stepBot } from "./bots.js";
 import type { ObjectType, ServerMessage } from "./protocol.js";
 import { Random } from "./random.js";
 import type {
   BotState,
   City,
+  CollisionEvent,
   EntitySnapshot,
   LeaderboardEntry,
   PlayerInput,
@@ -27,6 +28,32 @@ const PLAYER_COLORS = [
   "#2dd4bf",
   "#c084fc",
 ] as const;
+
+/**
+ * Физика столкновений машин — те же цифры, что в офлайн-движке клиента
+ * (citi_ads/src/game/engine.ts), чтобы онлайн ощущался так же.
+ */
+const COLLIDE_RADIUS = 19; // радиус кузова для столкновений машин
+const KICK = 1.25; // во столько раз скорость тарана превращается в отлёт
+const RAM_MIN = 70; // ниже этой скорости сближения это не таран, а тычок в пробке
+const KICK_MIN = 110; // слабый тычок всё равно должен быть заметен
+const KICK_MAX = 620;
+const STUN_SECONDS = 0.5; // сколько протараненный бот не слушается руля
+const CANISTER_COOL = 1.3; // столько выпавшую канистру нельзя подобрать
+const SPILL_RADIUS = 90; // радиус разлёта канистр от места удара
+
+/** Общий вид на игрока и бота, чтобы считать столкновения одним циклом. */
+interface CollisionBody {
+  id: string;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  /** Машина под колонкой — стенка: её не отбросить и канистры из неё не выбить. */
+  fixed: boolean;
+  player: PlayerState | null;
+  bot: BotState | null;
+}
 
 interface UnlockTask {
   seconds: number;
@@ -82,6 +109,7 @@ export class GameRoom extends EventEmitter {
   private objectsDirty = false;
   private readonly eventResults = new Map<string, Map<string, GameEventResult>>();
   private readonly refuelSessions = new Map<string, { stationId: string; liters: number }>();
+  private collisionEvents: CollisionEvent[] = [];
 
   constructor(config: GameConfig = CONFIG) {
     super();
@@ -126,6 +154,8 @@ export class GameRoom extends EventEmitter {
       input: emptyInput(),
       lastInputSeq: -1,
       lastMoveAt: Date.now(),
+      kx: 0,
+      ky: 0,
     };
     this.players.set(id, player);
 
@@ -392,6 +422,7 @@ export class GameRoom extends EventEmitter {
     for (const canister of this.city.canisters) canister.cool = Math.max(0, canister.cool - safeDt);
     for (const player of this.players.values()) if (player.status === "active") this.stepPlayer(player, safeDt);
     this.stepBots(safeDt);
+    this.carCollisions();
 
     if (this.objectsDirty) {
       this.objectsDirty = false;
@@ -404,6 +435,17 @@ export class GameRoom extends EventEmitter {
           canisters: this.city.canisters,
         },
       });
+    }
+
+    // Столкновения отправляем сразу тем же тиком: искры, тряска и звук удара
+    // должны совпасть с моментом удара, а не ждать очередного снапшота.
+    if (this.collisionEvents.length > 0) {
+      const collisions = this.collisionEvents;
+      this.collisionEvents = [];
+      this.emitMessage({ type: "world:collisions", payload: { tick: this.tickNumber, collisions } });
+      // отскок меняет положение резко — клиенту нужны свежие координаты
+      this.snapshotAccumulator = 0;
+      this.emitMessage({ type: "world:entities", payload: this.entitySnapshot() });
     }
 
     this.snapshotAccumulator += safeDt;
@@ -630,6 +672,7 @@ export class GameRoom extends EventEmitter {
     );
     player.x += Math.cos(player.angle) * player.speed * dt;
     player.y += Math.sin(player.angle) * player.speed * dt;
+    this.applyPlayerKnock(player, dt);
     this.resolvePlayerCollisions(player);
     this.pickNearbyCanister(player);
 
@@ -736,6 +779,206 @@ export class GameRoom extends EventEmitter {
     );
   }
 
+  /** Отлёт игрока после тарана: гасим импульс и двигаем машину независимо от руля. */
+  private applyPlayerKnock(player: PlayerState, dt: number): void {
+    if (player.kx === 0 && player.ky === 0) return;
+    player.x += player.kx * dt;
+    player.y += player.ky * dt;
+    const decay = Math.exp(-3.4 * dt);
+    player.kx *= decay;
+    player.ky *= decay;
+    if (Math.hypot(player.kx, player.ky) < 4) {
+      player.kx = 0;
+      player.ky = 0;
+    }
+  }
+
+  /**
+   * Столкновения машин — порт carCollisions() из офлайн-движка клиента.
+   * Считаем все пары «игрок/бот»: сначала расталкиваем кузова, потом смотрим,
+   * кто в кого въехал, и уже таранившему даём отдачу, а протаранённому —
+   * отлёт, стан и выпадение канистр.
+   */
+  private carCollisions(): void {
+    const bodies: CollisionBody[] = [];
+    for (const player of this.players.values()) {
+      if (player.status !== "active") continue;
+      bodies.push({
+        id: player.id,
+        x: player.x,
+        y: player.y,
+        vx: Math.cos(player.angle) * player.speed + player.kx,
+        vy: Math.sin(player.angle) * player.speed + player.ky,
+        fixed: this.isAtActiveStation(player),
+        player,
+        bot: null,
+      });
+    }
+    for (const bot of this.bots) {
+      bodies.push({
+        id: bot.id,
+        x: bot.x,
+        y: bot.y,
+        vx: Math.cos(bot.angle) * bot.speed + bot.kx,
+        vy: Math.sin(bot.angle) * bot.speed + bot.ky,
+        fixed: bot.wait > 0,
+        player: null,
+        bot,
+      });
+    }
+
+    const contact = COLLIDE_RADIUS * 2;
+    for (let i = 0; i < bodies.length; i += 1) {
+      for (let j = i + 1; j < bodies.length; j += 1) {
+        const a = bodies[i]!;
+        const b = bodies[j]!;
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let distance = Math.hypot(dx, dy);
+        if (distance >= contact) continue;
+        if (distance < 0.001) {
+          dx = 1;
+          dy = 0;
+          distance = 0.001;
+        }
+        const nx = dx / distance;
+        const ny = dy / distance;
+
+        // расталкиваем, чтобы кузова не слипались
+        const push = contact - distance;
+        const weightA = a.fixed ? 0 : b.fixed ? 1 : 0.5;
+        const weightB = b.fixed ? 0 : a.fixed ? 1 : 0.5;
+        moveBody(a, -nx * push * weightA, -ny * push * weightA);
+        moveBody(b, nx * push * weightB, ny * push * weightB);
+
+        // кто в кого въехал: сравниваем сближение вдоль оси удара
+        const intoB = a.vx * nx + a.vy * ny;
+        const intoA = -(b.vx * nx + b.vy * ny);
+        // едут рядом и лишь коснулись боками — просто разъезжаются, без тарана,
+        // иначе машины в потоке бесконечно пинали бы друг друга
+        if (Math.max(intoB, intoA) < RAM_MIN) continue;
+        const aRams = intoB >= intoA;
+        const rammer = aRams ? a : b;
+        const victim = aRams ? b : a;
+        const dirX = aRams ? nx : -nx;
+        const dirY = aRams ? ny : -ny;
+        const force = clamp(Math.max(intoB, intoA) * KICK, KICK_MIN, KICK_MAX);
+        const contactX = a.x + nx * COLLIDE_RADIUS;
+        const contactY = a.y + ny * COLLIDE_RADIUS;
+
+        this.brakeRammer(rammer, -dirX * force * 0.16, -dirY * force * 0.16);
+
+        let spilled = 0;
+        // машина под колонкой — стенка: её не отбросить и канистры из неё не выбить
+        if (!victim.fixed) {
+          this.kickBody(victim, dirX * force, dirY * force);
+          const carried = victim.bot ? victim.bot.taken : victim.player?.canisters ?? 0;
+          if (carried > 0) spilled = this.spillCanisters(victim, carried, contactX, contactY);
+        }
+
+        this.collisionEvents.push({
+          x: contactX,
+          y: contactY,
+          force,
+          rammerId: rammer.id,
+          victimId: victim.id,
+          rammerIsPlayer: rammer.player !== null,
+          victimIsPlayer: victim.player !== null,
+          spilled,
+        });
+      }
+    }
+  }
+
+  /** Протаранённому — отлёт: игрока просто отбрасывает, бота ещё и ведёт. */
+  private kickBody(body: CollisionBody, kx: number, ky: number): void {
+    if (body.fixed) return;
+    if (body.bot) {
+      body.bot.kx += kx;
+      body.bot.ky += ky;
+      body.bot.stun = STUN_SECONDS;
+      body.bot.speed *= 0.4;
+      body.bot.angle += (this.rng.next() - 0.5) * 0.9;
+      body.bot.think = 0;
+    } else if (body.player) {
+      body.player.kx += kx;
+      body.player.ky += ky;
+      body.player.speed *= 0.45;
+    }
+  }
+
+  /** Таранившему — отдача: скорость гаснет, но управление остаётся. */
+  private brakeRammer(body: CollisionBody, kx: number, ky: number): void {
+    if (body.fixed) return;
+    if (body.bot) {
+      body.bot.kx += kx;
+      body.bot.ky += ky;
+      body.bot.speed *= 0.55;
+    } else if (body.player) {
+      body.player.kx += kx;
+      body.player.ky += ky;
+      body.player.speed *= 0.6;
+    }
+  }
+
+  /** Канистры протараненной машины разлетаются вокруг места удара. */
+  private spillCanisters(victim: CollisionBody, count: number, x: number, y: number): number {
+    const pool = this.city.canisters.filter((canister) => canister.taken);
+    const drop = Math.min(count, pool.length);
+    if (drop <= 0) return 0;
+    for (let index = 0; index < drop; index += 1) {
+      const canister = pool[index]!;
+      const spot = this.spillSpot(x, y);
+      canister.x = spot.x;
+      canister.y = spot.y;
+      canister.taken = false;
+      canister.cool = CANISTER_COOL;
+    }
+    if (victim.bot) {
+      victim.bot.taken -= drop;
+      victim.bot.gotCanister = victim.bot.taken > 0;
+      victim.bot.think = 0;
+    } else if (victim.player) {
+      // у игрока канистра — это ещё и +10 л к баку, значит бак сдувается обратно
+      victim.player.canisters -= drop;
+      victim.player.tankVolume = Math.max(
+        this.config.startTankVolume,
+        victim.player.tankVolume - drop * this.config.canisterTankBonus,
+      );
+      victim.player.fuel = Math.min(victim.player.fuel, victim.player.tankVolume);
+    }
+    this.objectsDirty = true;
+    return drop;
+  }
+
+  /** Точка для выпавшей канистры: рядом с ударом, но не внутри здания. */
+  private spillSpot(x: number, y: number): { x: number; y: number } {
+    const worldSize = this.city.meta.worldSize;
+    for (let tries = 0; tries < 12; tries += 1) {
+      const angle = this.rng.next() * Math.PI * 2;
+      const radius = SPILL_RADIUS * (0.35 + this.rng.next() * 0.65);
+      const px = clamp(x + Math.cos(angle) * radius, 40, worldSize - 40);
+      const py = clamp(y + Math.sin(angle) * radius, 40, worldSize - 40);
+      const blocked = this.city.buildings.some(
+        (building) =>
+          px > building.x - 6 &&
+          px < building.x + building.w + 6 &&
+          py > building.y - 6 &&
+          py < building.y + building.h + 6,
+      );
+      if (!blocked) return { x: px, y: py };
+    }
+    return { x: clamp(x, 40, worldSize - 40), y: clamp(y, 40, worldSize - 40) };
+  }
+
+  /** Игрок стоит на площадке работающей АЗС — считаем его неподвижной стенкой. */
+  private isAtActiveStation(player: PlayerState): boolean {
+    if (Math.abs(player.speed) > 30) return false;
+    return this.city.stations.some(
+      (station) => station.state === "active" && isInside(player, station),
+    );
+  }
+
   private resolvePlayerCollisions(player: PlayerState): void {
     let collided = false;
     for (const building of this.city.buildings) {
@@ -780,6 +1023,19 @@ function emptyInput(): PlayerInput {
 function publicPlayer(player: PlayerState): PublicPlayerState {
   const { input: _input, lastMoveAt: _lastMoveAt, ...publicState } = player;
   return publicState;
+}
+
+function moveBody(body: CollisionBody, dx: number, dy: number): void {
+  if (!dx && !dy) return;
+  body.x += dx;
+  body.y += dy;
+  if (body.bot) {
+    body.bot.x = body.x;
+    body.bot.y = body.y;
+  } else if (body.player) {
+    body.player.x = body.x;
+    body.player.y = body.y;
+  }
 }
 
 function clamp(value: number, min: number, max: number): number {

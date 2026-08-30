@@ -170,6 +170,20 @@ function waypoint(bot: BotState, city: City, goal: BotGoal): { x: number; y: num
   return Math.abs(bot.x - botX) < Math.abs(bot.y - botY) ? { x: botX, y: bot.y } : { x: bot.x, y: botY };
 }
 
+/** Отлёт после тарана: гасим импульс и двигаем машину независимо от руля. */
+export function applyKnock(bot: BotState, worldSize: number, dt: number): void {
+  if (bot.kx === 0 && bot.ky === 0) return;
+  bot.x = clamp(bot.x + bot.kx * dt, 30, worldSize - 30);
+  bot.y = clamp(bot.y + bot.ky * dt, 30, worldSize - 30);
+  const decay = Math.exp(-3.4 * dt);
+  bot.kx *= decay;
+  bot.ky *= decay;
+  if (Math.hypot(bot.kx, bot.ky) < 4) {
+    bot.kx = 0;
+    bot.ky = 0;
+  }
+}
+
 function drive(
   bot: BotState,
   target: { x: number; y: number },
@@ -241,6 +255,9 @@ export function createBot(
     style: 0.82 + rng.next() * 0.18,
     lane: (rng.bool() ? -1 : 1) * (18 + rng.next() * 26),
     wobble: rng.next() * Math.PI * 2,
+    kx: 0,
+    ky: 0,
+    stun: 0,
   };
   rollPlan(bot, rng);
   return bot;
@@ -254,6 +271,14 @@ export function stepBot(
   config: GameConfig = CONFIG,
 ): BotStep {
   const result: BotStep = { canister: null, station: null, soldAtBase: false };
+  applyKnock(bot, city.meta.worldSize, dt);
+  if (bot.stun > 0) {
+    // получил в бок — пару мгновений машину просто несёт
+    bot.stun = Math.max(0, bot.stun - dt);
+    bot.speed *= Math.max(0, 1 - 4 * dt);
+    bot.think = 0;
+    return result;
+  }
   if (bot.wait > 0) {
     bot.wait = Math.max(0, bot.wait - dt);
     bot.speed *= Math.max(0, 1 - 6 * dt);

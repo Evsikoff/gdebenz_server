@@ -130,6 +130,9 @@ export interface PlayerState extends Point {
   input: PlayerInput;
   lastInputSeq: number;
   lastMoveAt: number;
+  /** Накопленный отскок после тарана, пикс/с. Гасится каждый тик. */
+  kx: number;
+  ky: number;
 }
 
 export type BotPlan = "station" | "canister";
@@ -151,6 +154,11 @@ export interface BotState extends Point {
   style: number;
   lane: number;
   wobble: number;
+  /** Накопленный отскок после тарана, пикс/с. Гасится каждый тик. */
+  kx: number;
+  ky: number;
+  /** Пока > 0, бот после удара не слушается руля. */
+  stun: number;
 }
 
 export type BotGoal =
@@ -160,6 +168,25 @@ export type BotGoal =
   | { kind: "wander"; x: number; y: number };
 
 export interface PublicPlayerState extends Omit<PlayerState, "input" | "lastMoveAt"> {}
+
+/**
+ * Столкновение двух машин: сервер считает его сам и рассылает клиентам,
+ * чтобы те нарисовали искры, тряхнули камеру и дали звук удара.
+ */
+export interface CollisionEvent {
+  /** Точка касания кузовов в мировых координатах. */
+  x: number;
+  y: number;
+  /** Сила удара — та же величина, что уходит в отскок. */
+  force: number;
+  /** Кто протаранил и кого: id игрока или бота. */
+  rammerId: string;
+  victimId: string;
+  rammerIsPlayer: boolean;
+  victimIsPlayer: boolean;
+  /** Сколько канистр выбило из протаранённой машины. */
+  spilled: number;
+}
 
 export interface LeaderboardEntry {
   entityId: string;

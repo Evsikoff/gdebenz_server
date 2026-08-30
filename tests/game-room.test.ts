@@ -289,4 +289,164 @@ describe("GameRoom", () => {
       [room.bots[0]!.name, 8, 3],
     ]);
   });
+
+  it("отбрасывает машины и рассылает событие при таране игрока в бота", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 2 });
+    const player = room.addPlayer("Таран");
+    const bot = room.bots[0]!;
+    for (const other of room.bots.slice(1)) {
+      other.x = 100;
+      other.y = 100;
+      other.speed = 0;
+      other.wait = 999;
+    }
+    const messages: unknown[] = [];
+    room.on("message", (message) => messages.push(message));
+
+    // ставим бота ровно перед носом игрока и разгоняем игрока в него
+    bot.x = player.x + 30;
+    bot.y = player.y;
+    bot.speed = 0;
+    bot.wait = 0;
+    bot.kx = 0;
+    bot.ky = 0;
+    player.angle = 0;
+    player.speed = 500;
+
+    room.step(1 / 30);
+
+    const collision = messages.find(
+      (message) => (message as { type: string }).type === "world:collisions",
+    ) as { payload: { collisions: Array<{ force: number; rammerId: string; victimId: string }> } } | undefined;
+
+    expect(collision).toBeDefined();
+    expect(collision!.payload.collisions).toHaveLength(1);
+    expect(collision!.payload.collisions[0]!.rammerId).toBe(player.id);
+    expect(collision!.payload.collisions[0]!.victimId).toBe(bot.id);
+    expect(collision!.payload.collisions[0]!.force).toBeGreaterThan(0);
+    // протаранённого отбросило и оглушило, таранивший потерял скорость
+    expect(Math.hypot(bot.kx, bot.ky)).toBeGreaterThan(0);
+    expect(bot.stun).toBeGreaterThan(0);
+    expect(player.speed).toBeLessThan(500);
+    // кузова расталкиваются, а не слипаются
+    expect(Math.hypot(bot.x - player.x, bot.y - player.y)).toBeGreaterThan(30);
+  });
+
+  it("выбивает канистры из протаранённого бота", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 2 });
+    const player = room.addPlayer("Таран");
+    const bot = room.bots[0]!;
+    for (const other of room.bots.slice(1)) {
+      other.x = 100;
+      other.y = 100;
+      other.speed = 0;
+      other.wait = 999;
+    }
+    const canister = room.city.canisters[0]!;
+    canister.taken = true;
+    bot.taken = 1;
+    bot.wait = 0;
+
+    bot.x = player.x + 30;
+    bot.y = player.y;
+    bot.speed = 0;
+    player.angle = 0;
+    player.speed = 500;
+
+    room.step(1 / 30);
+
+    expect(bot.taken).toBe(0);
+    expect(canister.taken).toBe(false);
+    expect(canister.cool).toBeGreaterThan(0);
+  });
+
+  it("не считает тараном лёгкое касание бортами", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 2 });
+    const player = room.addPlayer("Сосед");
+    const bot = room.bots[0]!;
+    for (const other of room.bots.slice(1)) {
+      other.x = 100;
+      other.y = 100;
+      other.speed = 0;
+      other.wait = 999;
+    }
+    const messages: unknown[] = [];
+    room.on("message", (message) => messages.push(message));
+
+    // едут рядом в одну сторону и лишь коснулись боками
+    bot.x = player.x;
+    bot.y = player.y + 30;
+    bot.angle = 0;
+    bot.speed = 200;
+    bot.wait = 0;
+    player.angle = 0;
+    player.speed = 200;
+
+    room.step(1 / 30);
+
+    expect(messages.some((message) => (message as { type: string }).type === "world:collisions")).toBe(false);
+    expect(bot.stun).toBe(0);
+  });
+
+  it("сталкивает игроков между собой", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 2 });
+    const first = room.addPlayer("Первый");
+    const second = room.addPlayer("Второй");
+    for (const bot of room.bots) {
+      bot.x = 100;
+      bot.y = 100;
+      bot.speed = 0;
+      bot.wait = 999;
+    }
+    const messages: unknown[] = [];
+    room.on("message", (message) => messages.push(message));
+
+    second.x = first.x + 30;
+    second.y = first.y;
+    second.speed = 0;
+    first.angle = 0;
+    first.speed = 500;
+
+    room.step(1 / 30);
+
+    const collision = messages.find(
+      (message) => (message as { type: string }).type === "world:collisions",
+    ) as { payload: { collisions: Array<{ rammerId: string; victimId: string; victimIsPlayer: boolean }> } } | undefined;
+
+    expect(collision).toBeDefined();
+    expect(collision!.payload.collisions[0]!.rammerId).toBe(first.id);
+    expect(collision!.payload.collisions[0]!.victimId).toBe(second.id);
+    expect(collision!.payload.collisions[0]!.victimIsPlayer).toBe(true);
+    expect(Math.hypot(second.kx, second.ky)).toBeGreaterThan(0);
+  });
+
+  it("выбивает канистры из протаранённого игрока и возвращает объём бака", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 2 });
+    const first = room.addPlayer("Первый");
+    const second = room.addPlayer("Второй");
+    for (const bot of room.bots) {
+      bot.x = 100;
+      bot.y = 100;
+      bot.speed = 0;
+      bot.wait = 999;
+    }
+    const canister = room.city.canisters[0]!;
+    canister.taken = true;
+    second.canisters = 1;
+    second.tankVolume = CONFIG.startTankVolume + CONFIG.canisterTankBonus;
+    second.fuel = second.tankVolume;
+
+    second.x = first.x + 30;
+    second.y = first.y;
+    second.speed = 0;
+    first.angle = 0;
+    first.speed = 500;
+
+    room.step(1 / 30);
+
+    expect(second.canisters).toBe(0);
+    expect(second.tankVolume).toBe(CONFIG.startTankVolume);
+    expect(second.fuel).toBeLessThanOrEqual(CONFIG.startTankVolume);
+    expect(canister.taken).toBe(false);
+  });
 });
