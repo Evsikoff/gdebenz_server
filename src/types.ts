@@ -133,6 +133,24 @@ export interface PlayerState extends Point {
   /** Накопленный отскок после тарана, пикс/с. Гасится каждый тик. */
   kx: number;
   ky: number;
+  /** Идёт заправка: машина стоит под колонкой и топливо льётся по refuelRate. */
+  refueling: boolean;
+  /** Колонка, под которой идёт заправка. */
+  refuelStationId: string | null;
+  /** Сколько литров уже налито в текущей сессии — против лимита колонки. */
+  refuelLiters: number;
+  /** Сколько рублей уже отдано в текущей сессии. */
+  refuelSpent: number;
+  /**
+   * Площадка, с которой машина ещё не съехала после заправки. Пока стоим на
+   * ней, заправку заново не начать: иначе долитый бак тратил бы пару капель и
+   * колонка блокировалась бы навсегда.
+   */
+  usedStationId: string | null;
+  /** Множитель максимальной скорости от бустеров: 1 — без бустера. */
+  speedMultiplier: number;
+  /** Множитель расхода топлива от бустеров: 1 — без бустера, меньше — экономнее. */
+  fuelConsumptionMultiplier: number;
 }
 
 export type BotPlan = "station" | "canister";
@@ -168,6 +186,30 @@ export type BotGoal =
   | { kind: "wander"; x: number; y: number };
 
 export interface PublicPlayerState extends Omit<PlayerState, "input" | "lastMoveAt"> {}
+
+/** Что бустер сделал с игроком — клиенту, чтобы показать результат. */
+export interface BoosterEffect {
+  systemName: string;
+  /** Машина завелась заново: заглохшему долили топлива. */
+  revived: boolean;
+  speedMultiplier: number;
+  fuelConsumptionMultiplier: number;
+}
+
+/**
+ * Заправка началась или закончилась. Клиент по этому событию даёт звук
+ * колонки, конфетти на полном баке и сообщает, почему заправка прервалась.
+ */
+export interface RefuelEvent {
+  playerId: string;
+  stationId: string;
+  state: "started" | "stopped";
+  /** Почему заправка закончилась: бак полон, лимит колонки, деньги или отъезд. */
+  reason: "full" | "limit" | "money" | "left" | null;
+  /** Итог сессии: сколько налито и на сколько рублей. */
+  liters: number;
+  spent: number;
+}
 
 /**
  * Столкновение двух машин: сервер считает его сам и рассылает клиентам,

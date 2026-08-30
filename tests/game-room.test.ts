@@ -449,4 +449,229 @@ describe("GameRoom", () => {
     expect(second.fuel).toBeLessThanOrEqual(CONFIG.startTankVolume);
     expect(canister.taken).toBe(false);
   });
+
+  it("заправляет постепенно, а не мгновенно", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 0 });
+    const player = room.addPlayer("Заправщик");
+    const station = room.city.stations.find((value) => value.state === "active")!;
+    station.limit = null;
+    station.price = 100;
+    player.money = 1_000_000;
+    player.fuel = 0.5;
+    player.x = station.x + station.w / 2;
+    player.y = station.y + station.h / 2;
+    player.speed = 0;
+
+    room.step(1 / 30);
+    const afterFirstTick = player.fuel;
+
+    // за один тик наливается не больше refuelRate * dt
+    expect(afterFirstTick).toBeGreaterThan(0.5);
+    expect(afterFirstTick - 0.5).toBeLessThanOrEqual(CONFIG.refuelRate / 30 + 0.001);
+    expect(player.refueling).toBe(true);
+    expect(player.refuelStationId).toBe(station.id);
+    // колонка блокируется сразу, как только к ней встали
+    expect(station.state).toBe("locked");
+    // под колонкой машина стоит
+    expect(player.speed).toBe(0);
+
+    // полный бак набирается примерно за tankVolume / refuelRate секунд
+    let ticks = 1;
+    while (player.refueling && ticks < 30 * 60) {
+      room.step(1 / 30);
+      ticks += 1;
+    }
+    const expectedTicks = ((player.tankVolume - 0.5) / CONFIG.refuelRate) * 30;
+    expect(ticks).toBeGreaterThan(expectedTicks * 0.9);
+    expect(player.fuel).toBeCloseTo(player.tankVolume, 3);
+    expect(player.refuelSpent).toBeCloseTo(player.refuelLiters * station.price, 3);
+  });
+
+  it("останавливает заправку на лимите колонки", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 0 });
+    const player = room.addPlayer("Лимит");
+    const station = room.city.stations.find((value) => value.state === "active")!;
+    station.limit = 5;
+    station.price = 1;
+    player.money = 1_000_000;
+    player.fuel = 0.01;
+    player.x = station.x + station.w / 2;
+    player.y = station.y + station.h / 2;
+
+    const stops: Array<{ reason: string | null; liters: number }> = [];
+    room.on("message", (message) => {
+      const typed = message as { type: string; payload: { state?: string; reason: string | null; liters: number } };
+      if (typed.type === "player:refuel" && typed.payload.state === "stopped") {
+        stops.push({ reason: typed.payload.reason, liters: typed.payload.liters });
+      }
+    });
+
+    for (let i = 0; i < 30 * 5 && stops.length === 0; i += 1) room.step(1 / 30);
+
+    expect(stops).toHaveLength(1);
+    expect(stops[0]!.reason).toBe("limit");
+    expect(stops[0]!.liters).toBeCloseTo(5, 2);
+    expect(player.refueling).toBe(false);
+    // повторно встать под ту же колонку, не съехав, нельзя
+    expect(player.usedStationId).toBe(station.id);
+    room.step(1 / 30);
+    expect(player.refueling).toBe(false);
+  });
+
+  it("останавливает заправку, когда кончились деньги", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 0 });
+    const player = room.addPlayer("Безденежье");
+    const station = room.city.stations.find((value) => value.state === "active")!;
+    station.limit = null;
+    station.price = 100;
+    player.money = 200;
+    player.fuel = 0.01;
+    player.x = station.x + station.w / 2;
+    player.y = station.y + station.h / 2;
+
+    const stops: string[] = [];
+    room.on("message", (message) => {
+      const typed = message as { type: string; payload: { state?: string; reason: string | null } };
+      if (typed.type === "player:refuel" && typed.payload.state === "stopped" && typed.payload.reason) {
+        stops.push(typed.payload.reason);
+      }
+    });
+
+    for (let i = 0; i < 30 * 5 && stops.length === 0; i += 1) room.step(1 / 30);
+
+    expect(stops[0]).toBe("money");
+    expect(player.money).toBeLessThan(1);
+    expect(player.fuel).toBeCloseTo(2, 0);
+  });
+
+  it("бустер открывает именно ту АЗС, у которой стоит игрок", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 0 });
+    const player = room.addPlayer("Реклама");
+    const locked = room.city.stations.find((value) => value.state === "locked")!;
+    player.x = locked.x + locked.w / 2;
+    player.y = locked.y + locked.h / 2;
+
+    const result = room.interact(player.id, {
+      requestId: "r1",
+      objectType: "station",
+      objectId: locked.id,
+    }) as { payload: { ok: boolean; details?: Record<string, unknown> } };
+
+    expect(result.payload.ok).toBe(true);
+    expect(result.payload.details?.activated).toBe(true);
+    expect(result.payload.details?.stationId).toBe(locked.id);
+    expect(locked.state).toBe("active");
+    expect(locked.origin).toBe("ad");
+  });
+
+  it("не открывает АЗС, до которой игрок не доехал", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 0 });
+    const player = room.addPlayer("Далеко");
+    const locked = room.city.stations.find((value) => value.state === "locked")!;
+    player.x = locked.x + 5_000;
+    player.y = locked.y + 5_000;
+
+    const result = room.interact(player.id, {
+      requestId: "r2",
+      objectType: "station",
+      objectId: locked.id,
+    }) as { payload: { ok: boolean; code: string } };
+
+    expect(result.payload.ok).toBe(false);
+    expect(result.payload.code).toBe("too-far");
+    expect(locked.state).toBe("locked");
+  });
+
+  it("применяет бустеры на сервере и списывает за них деньги", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 0 });
+    const player = room.addPlayer("Бустеры");
+    const money = player.money;
+
+    const speed = room.reportBooster(player.id, "b1", "speed25", 500);
+    expect(speed.payload.ok).toBe(true);
+    expect(player.speedMultiplier).toBeCloseTo(1.25, 5);
+    expect(player.money).toBe(money - 500);
+
+    const consumption = room.reportBooster(player.id, "b2", "consumption35", 0);
+    expect(consumption.payload.ok).toBe(true);
+    expect(player.fuelConsumptionMultiplier).toBeCloseTo(0.65, 5);
+
+    const cash = room.reportBooster(player.id, "b3", "money0.5", 0);
+    expect(cash.payload.ok).toBe(true);
+    expect(player.money).toBe(money - 500 + Math.floor(CONFIG.startMoney * 0.5));
+
+    // повторный запрос с тем же requestId ничего не начисляет второй раз
+    const balance = player.money;
+    room.reportBooster(player.id, "b3", "money0.5", 0);
+    expect(player.money).toBe(balance);
+
+    expect(room.reportBooster(player.id, "b4", "teleport", 0).payload.ok).toBe(false);
+  });
+
+  it("бустер топлива поднимает заглохшего игрока", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 0 });
+    const player = room.addPlayer("Заглох");
+    player.fuel = 0;
+    room.reportPlayerLost(player.id, "lost1", "fuel-empty");
+    expect(player.status).toBe("lost");
+
+    const result = room.reportBooster(player.id, "b5", "fuel10l", 0);
+
+    expect(result.payload.ok).toBe(true);
+    expect(result.payload.details?.revived).toBe(true);
+    expect(player.status).toBe("active");
+    expect(player.fuel).toBeCloseTo(10, 5);
+  });
+
+  it("бустер скорости поднимает потолок скорости в симуляции", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 0 });
+    const plain = room.addPlayer("Обычный");
+    const boosted = room.addPlayer("Быстрый");
+    room.reportBooster(boosted.id, "b6", "speed25", 0);
+
+    // потолок скорости срезается в stepPlayer, поэтому достаточно одного тика
+    for (const player of [plain, boosted]) {
+      player.fuel = 50;
+      player.speed = CONFIG.maxSpeed * 4;
+      room.setInput(player.id, {
+        up: true,
+        down: false,
+        left: false,
+        right: false,
+        handbrake: false,
+        seq: 1,
+        worldRevision: room.revision,
+      });
+    }
+    room.step(1 / 30);
+
+    expect(plain.speed).toBeLessThanOrEqual(CONFIG.maxSpeed + 0.001);
+    expect(boosted.speed).toBeGreaterThan(CONFIG.maxSpeed);
+    expect(boosted.speed).toBeLessThanOrEqual(CONFIG.maxSpeed * 1.25 + 0.001);
+  });
+
+  it("бустер расхода экономит топливо", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 0 });
+    const plain = room.addPlayer("Обычный");
+    const boosted = room.addPlayer("Экономный");
+    room.reportBooster(boosted.id, "b7", "consumption35", 0);
+
+    for (const player of [plain, boosted]) player.fuel = 50;
+    for (let i = 0; i < 30; i += 1) {
+      for (const player of [plain, boosted]) {
+        room.setInput(player.id, {
+          up: true,
+          down: false,
+          left: false,
+          right: false,
+          handbrake: false,
+          seq: i + 1,
+          worldRevision: room.revision,
+        });
+      }
+      room.step(1 / 30);
+    }
+
+    expect(50 - boosted.fuel).toBeLessThan(50 - plain.fuel);
+  });
 });
