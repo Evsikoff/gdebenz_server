@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { botCountForPlayers, CONFIG, mapScaleForPlayers, type GameConfig } from "./config.js";
-import { applyKnock, createBot, stepBot } from "./bots.js";
+import { createBot, stepBot } from "./bots.js";
 import type { ObjectType, ServerMessage } from "./protocol.js";
 import { messageForCode } from "./messages.js";
 import { Random } from "./random.js";
@@ -557,7 +557,7 @@ export class GameRoom extends EventEmitter {
       serverTime: Date.now(),
       worldRevision: this.worldRevision,
       players: [...this.players.values()].filter((player) => player.status === "active").map(publicPlayer),
-      bots: this.bots,
+      bots: this.bots.filter((bot) => bot.status === "active"),
     };
   }
 
@@ -585,7 +585,7 @@ export class GameRoom extends EventEmitter {
         liters: bot.filledLiters,
         isPlayer: false,
         color: bot.color,
-        active: true,
+        active: bot.status === "active",
         order: this.players.size + order,
       })),
     ]
@@ -1010,16 +1010,34 @@ export class GameRoom extends EventEmitter {
 
   private stepBots(dt: number): void {
     let leaderboardChanged = false;
-    for (const bot of this.bots) {
-      const result = stepBot(bot, this.city, dt, this.rng, this.config);
+    const players = [...this.players.values()]
+      .filter((player) => player.status === "active")
+      .map(({ id, x, y }) => ({ id, x, y }));
+    for (let index = 0; index < this.bots.length; index += 1) {
+      let bot = this.bots[index]!;
+      if (bot.status !== "active") {
+        bot.respawnRemaining = Math.max(0, bot.respawnRemaining - dt);
+        if (bot.respawnRemaining > 0) continue;
+        const occupied = [
+          ...this.bots.filter((value, otherIndex) => otherIndex !== index && value.status === "active"),
+          ...players,
+        ];
+        bot = createBot(index, this.city, occupied, this.rng, this.config);
+        this.bots[index] = bot;
+        leaderboardChanged = true;
+      }
+
+      const result = stepBot(bot, this.city, dt, players, this.rng, this.config);
+      if (result.lost) {
+        leaderboardChanged = true;
+        continue;
+      }
       this.resolveBotCollisions(bot);
       if (result.canister) this.objectsDirty = true;
       if (result.station) {
-        const requested = 18 + bot.taken * this.config.canisterTankBonus;
-        bot.filledLiters += Math.min(requested, result.station.limit ?? requested);
         this.takeStation(result.station, bot.taken);
-        leaderboardChanged = true;
       }
+      if (result.filledLiters > 0) leaderboardChanged = true;
     }
     if (leaderboardChanged) this.emitLeaderboard();
   }
@@ -1143,6 +1161,7 @@ export class GameRoom extends EventEmitter {
       });
     }
     for (const bot of this.bots) {
+      if (bot.status !== "active") continue;
       bodies.push({
         id: bot.id,
         x: bot.x,
@@ -1264,6 +1283,11 @@ export class GameRoom extends EventEmitter {
     }
     if (victim.bot) {
       victim.bot.taken -= drop;
+      victim.bot.tankVolume = Math.max(
+        this.config.startTankVolume,
+        victim.bot.tankVolume - drop * this.config.canisterTankBonus,
+      );
+      victim.bot.fuel = Math.min(victim.bot.fuel, victim.bot.tankVolume);
       victim.bot.gotCanister = victim.bot.taken > 0;
       victim.bot.think = 0;
     } else if (victim.player) {

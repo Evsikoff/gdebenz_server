@@ -165,17 +165,32 @@ export interface BotState extends Point {
   angle: number;
   speed: number;
   color: string;
+  fuel: number;
+  tankVolume: number;
+  money: number;
+  status: PlayerStatus;
   filledLiters: number;
   plan: BotPlan;
   goal: BotGoal | null;
   gotCanister: boolean;
   refuelled: boolean;
   wait: number;
+  refuelStationId: string | null;
+  refuelDuration: number;
+  refuelRemaining: number;
+  refuelTargetLiters: number;
+  refuelLiters: number;
+  refuelSpent: number;
+  respawnRemaining: number;
   think: number;
   taken: number;
   style: number;
   lane: number;
   wobble: number;
+  lazy: number;
+  lazyCd: number;
+  aggro: number;
+  aggroCd: number;
   /** Накопленный отскок после тарана, пикс/с. Гасится каждый тик. */
   kx: number;
   ky: number;
@@ -187,6 +202,7 @@ export type BotGoal =
   | { kind: "station"; id: string; x: number; y: number }
   | { kind: "canister"; id: string; x: number; y: number }
   | { kind: "base"; x: number; y: number }
+  | { kind: "player"; id: string; x: number; y: number }
   | { kind: "wander"; x: number; y: number };
 
 export interface PublicPlayerState extends Omit<PlayerState, "input" | "lastMoveAt"> {}

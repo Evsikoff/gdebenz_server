@@ -299,6 +299,89 @@ describe("GameRoom", () => {
     ]);
   });
 
+  it("расходует топливо бота, убирает проигравшего и автоматически респаунит его", () => {
+    const config = {
+      ...smallRoomConfig,
+      botCount: 1,
+      startFuel: 1,
+      fuelBurnPerSecond: 1,
+      botRespawnDelay: 0.15,
+    };
+    const room = new GameRoom(config);
+    const bot = room.bots[0]!;
+    bot.fuel = 0.001;
+    bot.money = 0;
+    bot.tankVolume = 70;
+    bot.taken = 2;
+    bot.filledLiters = 12;
+    bot.aggroCd = 999;
+
+    room.step(1 / 30);
+
+    expect(bot.status).toBe("lost");
+    expect(bot.fuel).toBe(0);
+    expect(bot.respawnRemaining).toBeCloseTo(config.botRespawnDelay, 5);
+    expect(room.entitySnapshot().bots).toHaveLength(0);
+    expect(room.leaderboard().find((row) => row.entityId === bot.id)).toMatchObject({ active: false, liters: 12 });
+
+    room.step(0.1);
+    room.step(0.1);
+    const respawned = room.bots[0]!;
+    expect(respawned).not.toBe(bot);
+    expect(respawned).toMatchObject({
+      status: "active",
+      tankVolume: config.startTankVolume,
+      money: config.startMoney,
+      taken: 0,
+      filledLiters: 0,
+    });
+    expect(respawned.fuel).toBeGreaterThan(0);
+    expect(respawned.fuel).toBeLessThanOrEqual(config.startFuel);
+    expect(room.entitySnapshot().bots).toHaveLength(1);
+  });
+
+  it("заправляет бота постепенно и списывает с него деньги", () => {
+    const config = {
+      ...smallRoomConfig,
+      botCount: 1,
+      fuelBurnPerSecond: 0,
+      stationTimeoutBase: 0.2,
+      stationTimeoutPerCanister: 0,
+      stationLimitChance: 0,
+    };
+    const room = new GameRoom(config);
+    const bot = room.bots[0]!;
+    const station = room.city.stations.find((value) => value.state === "active")!;
+    station.limit = null;
+    station.price = 100;
+    bot.x = station.x + station.w / 2;
+    bot.y = station.y + station.h / 2;
+    bot.fuel = 0.01;
+    bot.money = 200;
+    bot.plan = "station";
+    bot.goal = { kind: "station", id: station.id, x: bot.x, y: bot.y };
+    bot.aggroCd = 999;
+
+    room.step(1 / 30);
+
+    expect(bot.refuelStationId).toBe(station.id);
+    expect(bot.refuelDuration).toBeCloseTo(0.2, 5);
+    expect(station.state).toBe("locked");
+    expect(room.entitySnapshot().bots[0]).toMatchObject({
+      fuel: bot.fuel,
+      money: bot.money,
+      refuelStationId: station.id,
+      refuelDuration: 0.2,
+    });
+
+    for (let index = 0; index < 8; index += 1) room.step(1 / 30);
+
+    expect(bot.refuelStationId).toBeNull();
+    expect(bot.money).toBeCloseTo(0, 3);
+    expect(bot.fuel).toBeCloseTo(2.01, 2);
+    expect(bot.filledLiters).toBeCloseTo(2, 2);
+  });
+
   it("отбрасывает машины и рассылает событие при таране игрока в бота", () => {
     const room = new GameRoom({ ...smallRoomConfig, botCount: 2 });
     const player = room.addPlayer("Таран");

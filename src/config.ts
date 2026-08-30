@@ -7,6 +7,8 @@
 export interface GameConfig {
   /** Максимальное число участников, которое сервер дополняет ботами. */
   botCount: number;
+  /** Через сколько секунд проигравший бот возвращается в заезд. */
+  botRespawnDelay: number;
   fuelBurnPerSecond: number;
   stationTimeoutBase: number;
   stationTimeoutPerCanister: number;
@@ -47,6 +49,7 @@ export interface GameConfig {
 
 export const CONFIG: Readonly<GameConfig> = Object.freeze({
   botCount: 10,
+  botRespawnDelay: 3,
   fuelBurnPerSecond: 0.57,
   // Полное время обслуживания: base + perCanister * число канистр.
   // За этот интервал бак плавно заполняется до доступного уровня.
