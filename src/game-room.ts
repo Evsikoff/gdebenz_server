@@ -1,12 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { botCountForPlayers, CONFIG, mapScaleForPlayers, type GameConfig } from "./config.js";
-import { createBot, stepBot } from "./bots.js";
+import { applyKnock, createBot, stepBot } from "./bots.js";
 import type { ObjectType, ServerMessage } from "./protocol.js";
 import { Random } from "./random.js";
 import type {
   BotState,
+  BoosterEffect,
   City,
+  CollisionEvent,
+  RefuelEvent,
   EntitySnapshot,
   LeaderboardEntry,
   PlayerInput,
@@ -27,6 +30,32 @@ const PLAYER_COLORS = [
   "#2dd4bf",
   "#c084fc",
 ] as const;
+
+/**
+ * Физика столкновений машин — те же цифры, что в офлайн-движке клиента
+ * (citi_ads/src/game/engine.ts), чтобы онлайн ощущался так же.
+ */
+const COLLIDE_RADIUS = 19; // радиус кузова для столкновений машин
+const KICK = 1.25; // во столько раз скорость тарана превращается в отлёт
+const RAM_MIN = 70; // ниже этой скорости сближения это не таран, а тычок в пробке
+const KICK_MIN = 110; // слабый тычок всё равно должен быть заметен
+const KICK_MAX = 620;
+const STUN_SECONDS = 0.5; // сколько протараненный бот не слушается руля
+const CANISTER_COOL = 1.3; // столько выпавшую канистру нельзя подобрать
+const SPILL_RADIUS = 90; // радиус разлёта канистр от места удара
+
+/** Общий вид на игрока и бота, чтобы считать столкновения одним циклом. */
+interface CollisionBody {
+  id: string;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  /** Машина под колонкой — стенка: её не отбросить и канистры из неё не выбить. */
+  fixed: boolean;
+  player: PlayerState | null;
+  bot: BotState | null;
+}
 
 interface UnlockTask {
   seconds: number;
@@ -82,6 +111,7 @@ export class GameRoom extends EventEmitter {
   private objectsDirty = false;
   private readonly eventResults = new Map<string, Map<string, GameEventResult>>();
   private readonly refuelSessions = new Map<string, { stationId: string; liters: number }>();
+  private collisionEvents: CollisionEvent[] = [];
 
   constructor(config: GameConfig = CONFIG) {
     super();
@@ -126,6 +156,15 @@ export class GameRoom extends EventEmitter {
       input: emptyInput(),
       lastInputSeq: -1,
       lastMoveAt: Date.now(),
+      kx: 0,
+      ky: 0,
+      refueling: false,
+      refuelStationId: null,
+      refuelLiters: 0,
+      refuelSpent: 0,
+      usedStationId: null,
+      speedMultiplier: 1,
+      fuelConsumptionMultiplier: 1,
     };
     this.players.set(id, player);
 
@@ -243,6 +282,23 @@ export class GameRoom extends EventEmitter {
         const station = this.city.stations.find((value) => value.id === request.objectId);
         if (!station) return failure("object-not-found");
         if (!nearRect(player, station, this.config.carRadius + 25)) return failure("too-far");
+        // Закрытая АЗС — это запрос бустера «Активировать эту АЗС»: открываем
+        // именно её, а не случайную, как делает просмотр билборда.
+        if (station.state === "locked") {
+          if (!this.activateStation(station, "ad")) return failure("station-locked");
+          details = {
+            activated: true,
+            stationId: station.id,
+            price: station.price,
+            limit: station.limit,
+            stationsActive: this.city.stations.filter((value) => value.state === "active").length,
+            stationsTotal: this.city.stations.length,
+          };
+          break;
+        }
+        // Ниже — совместимость со старыми клиентами, которые заправлялись одним
+        // запросом. Актуальный клиент этого не шлёт: заправку ведёт сервер
+        // постепенно в updateRefuelling().
         if (station.state !== "active") return failure("station-locked");
         const room = Math.max(0, player.tankVolume - player.fuel);
         const requested = request.amount ?? room;
@@ -360,6 +416,40 @@ export class GameRoom extends EventEmitter {
     });
   }
 
+  /**
+   * Бустер, купленный игроком. Эффект применяет сервер: скорость, расход,
+   * топливо и деньги — его зона ответственности, и начисленное клиентом
+   * самому себе всё равно затёрлось бы ближайшим снапшотом.
+   */
+  reportBooster(playerId: string, requestId: string, systemName: string, cost = 0): GameEventResult {
+    return this.processGameEvent(playerId, requestId, "booster-applied", (player) => {
+      // Заглохшего игрока оживляет только канистра топлива — остальные бустеры
+      // ему уже ни к чему.
+      const revives = /^fuel(\d+(?:\.\d+)?)l$/.test(systemName);
+      if (player.status !== "active" && !revives) return { ok: false, code: "player-inactive" };
+      const price = Number.isFinite(cost) ? Math.max(0, Math.floor(cost)) : 0;
+      if (price > player.money) return { ok: false, code: "not-enough-money" };
+      const effect = this.applyBoosterEffect(player, systemName);
+      if (!effect) return { ok: false, code: "unknown-booster" };
+      player.money -= price;
+      if (effect.revived) {
+        this.emitMessage({ type: "player:respawned", payload: { player: publicPlayer(player) } });
+        this.emitLeaderboard();
+      }
+      return {
+        ok: true,
+        code: "accepted",
+        details: {
+          systemName: effect.systemName,
+          revived: effect.revived,
+          spent: price,
+          speedMultiplier: effect.speedMultiplier,
+          fuelConsumptionMultiplier: effect.fuelConsumptionMultiplier,
+        },
+      };
+    });
+  }
+
   respawnPlayer(playerId: string, requestId: string): GameEventResult {
     return this.processGameEvent(playerId, requestId, "player-respawn", (player) => {
       if (player.status === "active") return { ok: false, code: "player-already-active" };
@@ -376,6 +466,15 @@ export class GameRoom extends EventEmitter {
       player.status = "active";
       player.input = emptyInput();
       player.lastMoveAt = Date.now();
+      player.kx = 0;
+      player.ky = 0;
+      player.refueling = false;
+      player.refuelStationId = null;
+      player.refuelLiters = 0;
+      player.refuelSpent = 0;
+      player.usedStationId = null;
+      player.speedMultiplier = 1;
+      player.fuelConsumptionMultiplier = 1;
       this.refuelSessions.delete(player.id);
       this.emitMessage({ type: "player:respawned", payload: { player: publicPlayer(player) } });
       this.emitMessage({ type: "world:entities", payload: this.entitySnapshot() });
@@ -392,6 +491,7 @@ export class GameRoom extends EventEmitter {
     for (const canister of this.city.canisters) canister.cool = Math.max(0, canister.cool - safeDt);
     for (const player of this.players.values()) if (player.status === "active") this.stepPlayer(player, safeDt);
     this.stepBots(safeDt);
+    this.carCollisions();
 
     if (this.objectsDirty) {
       this.objectsDirty = false;
@@ -404,6 +504,17 @@ export class GameRoom extends EventEmitter {
           canisters: this.city.canisters,
         },
       });
+    }
+
+    // Столкновения отправляем сразу тем же тиком: искры, тряска и звук удара
+    // должны совпасть с моментом удара, а не ждать очередного снапшота.
+    if (this.collisionEvents.length > 0) {
+      const collisions = this.collisionEvents;
+      this.collisionEvents = [];
+      this.emitMessage({ type: "world:collisions", payload: { tick: this.tickNumber, collisions } });
+      // отскок меняет положение резко — клиенту нужны свежие координаты
+      this.snapshotAccumulator = 0;
+      this.emitMessage({ type: "world:entities", payload: this.entitySnapshot() });
     }
 
     this.snapshotAccumulator += safeDt;
@@ -600,7 +711,16 @@ export class GameRoom extends EventEmitter {
   }
 
   private stepPlayer(player: PlayerState, dt: number): void {
+    // Под колонкой машина стоит с заглушённым мотором: рулить нечем и топливо
+    // не жжём — ровно как в офлайне.
+    if (player.refueling) {
+      player.speed = 0;
+      this.updateRefuelling(player, dt);
+      return;
+    }
+
     const { input } = player;
+    const maxSpeed = this.playerMaxSpeed(player);
     if (player.fuel > 0 && input.up) player.speed += this.config.acceleration * dt;
     if (input.down) {
       player.speed =
@@ -620,24 +740,210 @@ export class GameRoom extends EventEmitter {
       player.speed -=
         Math.sign(player.speed) * Math.min(absolute, (absolute > 250 ? 560 : 150) * dt);
     }
-    player.speed = clamp(player.speed, -this.config.reverseMaxSpeed, this.config.maxSpeed);
+    player.speed = clamp(player.speed, -this.config.reverseMaxSpeed, maxSpeed);
 
     const direction = (input.left ? -1 : 0) + (input.right ? 1 : 0);
-    let steeringGrip = grip(player.speed, this.config.maxSpeed);
+    let steeringGrip = grip(player.speed, maxSpeed);
     if (input.handbrake) steeringGrip *= 1.75;
     player.angle = normalizeAngle(
       player.angle + direction * 3.1 * steeringGrip * (player.speed < -1 ? -1 : 1) * dt,
     );
     player.x += Math.cos(player.angle) * player.speed * dt;
     player.y += Math.sin(player.angle) * player.speed * dt;
+    this.applyPlayerKnock(player, dt);
     this.resolvePlayerCollisions(player);
     this.pickNearbyCanister(player);
 
-    const speedRatio = Math.abs(player.speed) / this.config.maxSpeed;
+    const speedRatio = Math.abs(player.speed) / maxSpeed;
     const burn =
       this.config.fuelBurnPerSecond *
+      player.fuelConsumptionMultiplier *
       (0.09 + (input.up && player.fuel > 0 ? 0.42 + speedRatio * 0.49 : 0) + (input.handbrake && Math.abs(player.speed) > 250 ? 0.39 : 0));
     player.fuel = Math.max(0, player.fuel - burn * dt);
+
+    this.updateRefuelling(player, dt);
+  }
+
+  private playerMaxSpeed(player: PlayerState): number {
+    return this.config.maxSpeed * player.speedMultiplier;
+  }
+
+  /**
+   * Заправка — порт updateFuel() из офлайн-движка клиента. Топливо льётся по
+   * refuelRate литров в секунду, пока машина стоит на площадке работающей АЗС.
+   * Начатую сессию доводим до полного бака, а колонку блокируем сразу, как
+   * только к ней встали. Останавливают заправку три вещи: полный бак, лимит
+   * колонки и деньги в кармане — что первым закончится.
+   */
+  private updateRefuelling(player: PlayerState, dt: number): void {
+    const station = this.stationUnderPlayer(player);
+    // повторно вставать под ту же колонку, не съехав с площадки, нельзя:
+    // иначе долитый до полного бак сразу тратит пару капель и заправка
+    // начинается заново, а машина остаётся заблокированной навсегда
+    const canStart = !!station && station.state === "active" && station.id !== player.usedStationId;
+    const canContinue = !!station && station.id === player.refuelStationId;
+
+    let step = 0;
+    let stop: RefuelEvent["reason"] = null;
+    if (station && (canStart || canContinue)) {
+      const poured = canContinue ? player.refuelLiters : 0;
+      const room = player.tankVolume - player.fuel;
+      const allowance = station.limit === null ? Number.POSITIVE_INFINITY : Math.max(0, station.limit - poured);
+      const affordable = station.price > 0 ? player.money / station.price : Number.POSITIVE_INFINITY;
+      step = Math.min(this.config.refuelRate * dt, room, allowance, affordable);
+      if (step <= 0.0005) stop = room <= 0.05 ? "full" : allowance <= 0.0005 ? "limit" : "money";
+    }
+
+    if (station && (canStart || canContinue) && step > 0.0005) {
+      if (!player.refueling) {
+        // машина встала под колонку — колонка занята
+        player.refueling = true;
+        player.refuelStationId = station.id;
+        player.refuelLiters = 0;
+        player.refuelSpent = 0;
+        player.speed = 0;
+        player.kx = 0;
+        player.ky = 0;
+        this.takeStation(station, player.canisters);
+        this.emitMessage({
+          type: "player:refuel",
+          payload: {
+            playerId: player.id,
+            stationId: station.id,
+            state: "started",
+            reason: null,
+            liters: 0,
+            spent: 0,
+          },
+        });
+      }
+      const before = player.fuel;
+      player.fuel = Math.min(player.tankVolume, player.fuel + step);
+      const filled = player.fuel - before;
+      const paid = filled * station.price;
+      player.money = Math.max(0, player.money - paid);
+      player.filledLiters += filled;
+      player.refuelLiters += filled;
+      player.refuelSpent += paid;
+      if (filled > 0) this.emitLeaderboard();
+      return;
+    }
+
+    if (!player.refueling) {
+      // простой заезд на площадку с полным баком тоже помечает её использованной,
+      // иначе заправка начнётся сама, стоит потратить пару капель
+      if (!station) player.usedStationId = null;
+      else if (station.state === "active" && station.id !== player.usedStationId && step <= 0.0005) {
+        player.usedStationId = station.id;
+      }
+      return;
+    }
+
+    // заправка закончилась
+    const finishedStationId = player.refuelStationId;
+    const liters = player.refuelLiters;
+    const spent = player.refuelSpent;
+    player.refueling = false;
+    player.refuelStationId = null;
+    player.usedStationId = finishedStationId;
+    if (finishedStationId) {
+      this.emitMessage({
+        type: "player:refuel",
+        payload: {
+          playerId: player.id,
+          stationId: finishedStationId,
+          state: "stopped",
+          reason: stop ?? "left",
+          liters,
+          spent,
+        },
+      });
+    }
+  }
+
+  /** Площадка АЗС, на которой сейчас стоит машина. Отступ тот же, что в офлайне. */
+  private stationUnderPlayer(player: PlayerState): Station | null {
+    if (player.fuel <= 0 && !player.refueling) return null;
+    return (
+      this.city.stations.find(
+        (station) =>
+          player.x > station.x - 6 &&
+          player.x < station.x + station.w + 6 &&
+          player.y > station.y - 6 &&
+          player.y < station.y + station.h + 6,
+      ) ?? null
+    );
+  }
+
+  /** Открывает конкретную закрытую АЗС — это и делает бустер «Активировать эту АЗС». */
+  private activateStation(station: Station, origin: "timer" | "ad"): boolean {
+    if (station.state !== "locked") return false;
+    station.state = "active";
+    station.origin = origin;
+    station.price = Math.round(
+      this.config.stationPriceMin + this.rng.next() * (this.config.stationPriceMax - this.config.stationPriceMin),
+    );
+    station.limit = this.rng.bool(this.config.stationLimitChance) ? this.config.stationFuelLimit : null;
+    this.objectsDirty = true;
+    return true;
+  }
+
+  /**
+   * Бустер: сервер — единственный источник правды по скорости, расходу,
+   * топливу и деньгам, поэтому эффект применяем здесь. Иначе ближайший же
+   * снапшот затирает то, что клиент начислил себе сам.
+   */
+  private applyBoosterEffect(player: PlayerState, systemName: string): BoosterEffect | null {
+    const effect = (revived: boolean): BoosterEffect => ({
+      systemName,
+      revived,
+      speedMultiplier: player.speedMultiplier,
+      fuelConsumptionMultiplier: player.fuelConsumptionMultiplier,
+    });
+
+    const speed = /^speed(\d+(?:\.\d+)?)$/.exec(systemName);
+    if (speed) {
+      const percent = Number(speed[1]);
+      if (!Number.isFinite(percent) || percent < 0 || percent > 500) return null;
+      player.speedMultiplier = Math.max(player.speedMultiplier, 1 + percent / 100);
+      return effect(false);
+    }
+
+    const consumption = /^consumption(\d+(?:\.\d+)?)$/.exec(systemName);
+    if (consumption) {
+      const percent = Number(consumption[1]);
+      if (!Number.isFinite(percent) || percent < 0 || percent > 100) return null;
+      player.fuelConsumptionMultiplier = Math.min(
+        player.fuelConsumptionMultiplier,
+        Math.max(0, 1 - percent / 100),
+      );
+      return effect(false);
+    }
+
+    const fuel = /^fuel(\d+(?:\.\d+)?)l$/.exec(systemName);
+    if (fuel) {
+      const liters = Number(fuel[1]);
+      if (!Number.isFinite(liters) || liters <= 0 || liters > player.tankVolume) return null;
+      const wasDown = player.fuel <= 0 || player.status !== "active";
+      player.fuel = Math.min(player.tankVolume, player.fuel + liters);
+      const revived = wasDown && player.fuel > 0;
+      if (revived && player.status !== "active") {
+        player.status = "active";
+        player.speed = 0;
+        player.lastMoveAt = Date.now();
+      }
+      return effect(revived);
+    }
+
+    const money = /^money(\d+(?:\.\d+)?)$/.exec(systemName);
+    if (money) {
+      const coefficient = Number(money[1]);
+      if (!Number.isFinite(coefficient) || coefficient <= 0 || coefficient > 100) return null;
+      player.money += Math.floor(this.config.startMoney * coefficient);
+      return effect(false);
+    }
+
+    return null;
   }
 
   private stepBots(dt: number): void {
@@ -736,6 +1042,206 @@ export class GameRoom extends EventEmitter {
     );
   }
 
+  /** Отлёт игрока после тарана: гасим импульс и двигаем машину независимо от руля. */
+  private applyPlayerKnock(player: PlayerState, dt: number): void {
+    if (player.kx === 0 && player.ky === 0) return;
+    player.x += player.kx * dt;
+    player.y += player.ky * dt;
+    const decay = Math.exp(-3.4 * dt);
+    player.kx *= decay;
+    player.ky *= decay;
+    if (Math.hypot(player.kx, player.ky) < 4) {
+      player.kx = 0;
+      player.ky = 0;
+    }
+  }
+
+  /**
+   * Столкновения машин — порт carCollisions() из офлайн-движка клиента.
+   * Считаем все пары «игрок/бот»: сначала расталкиваем кузова, потом смотрим,
+   * кто в кого въехал, и уже таранившему даём отдачу, а протаранённому —
+   * отлёт, стан и выпадение канистр.
+   */
+  private carCollisions(): void {
+    const bodies: CollisionBody[] = [];
+    for (const player of this.players.values()) {
+      if (player.status !== "active") continue;
+      bodies.push({
+        id: player.id,
+        x: player.x,
+        y: player.y,
+        vx: Math.cos(player.angle) * player.speed + player.kx,
+        vy: Math.sin(player.angle) * player.speed + player.ky,
+        fixed: this.isAtActiveStation(player),
+        player,
+        bot: null,
+      });
+    }
+    for (const bot of this.bots) {
+      bodies.push({
+        id: bot.id,
+        x: bot.x,
+        y: bot.y,
+        vx: Math.cos(bot.angle) * bot.speed + bot.kx,
+        vy: Math.sin(bot.angle) * bot.speed + bot.ky,
+        fixed: bot.wait > 0,
+        player: null,
+        bot,
+      });
+    }
+
+    const contact = COLLIDE_RADIUS * 2;
+    for (let i = 0; i < bodies.length; i += 1) {
+      for (let j = i + 1; j < bodies.length; j += 1) {
+        const a = bodies[i]!;
+        const b = bodies[j]!;
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let distance = Math.hypot(dx, dy);
+        if (distance >= contact) continue;
+        if (distance < 0.001) {
+          dx = 1;
+          dy = 0;
+          distance = 0.001;
+        }
+        const nx = dx / distance;
+        const ny = dy / distance;
+
+        // расталкиваем, чтобы кузова не слипались
+        const push = contact - distance;
+        const weightA = a.fixed ? 0 : b.fixed ? 1 : 0.5;
+        const weightB = b.fixed ? 0 : a.fixed ? 1 : 0.5;
+        moveBody(a, -nx * push * weightA, -ny * push * weightA);
+        moveBody(b, nx * push * weightB, ny * push * weightB);
+
+        // кто в кого въехал: сравниваем сближение вдоль оси удара
+        const intoB = a.vx * nx + a.vy * ny;
+        const intoA = -(b.vx * nx + b.vy * ny);
+        // едут рядом и лишь коснулись боками — просто разъезжаются, без тарана,
+        // иначе машины в потоке бесконечно пинали бы друг друга
+        if (Math.max(intoB, intoA) < RAM_MIN) continue;
+        const aRams = intoB >= intoA;
+        const rammer = aRams ? a : b;
+        const victim = aRams ? b : a;
+        const dirX = aRams ? nx : -nx;
+        const dirY = aRams ? ny : -ny;
+        const force = clamp(Math.max(intoB, intoA) * KICK, KICK_MIN, KICK_MAX);
+        const contactX = a.x + nx * COLLIDE_RADIUS;
+        const contactY = a.y + ny * COLLIDE_RADIUS;
+
+        this.brakeRammer(rammer, -dirX * force * 0.16, -dirY * force * 0.16);
+
+        let spilled = 0;
+        // машина под колонкой — стенка: её не отбросить и канистры из неё не выбить
+        if (!victim.fixed) {
+          this.kickBody(victim, dirX * force, dirY * force);
+          const carried = victim.bot ? victim.bot.taken : victim.player?.canisters ?? 0;
+          if (carried > 0) spilled = this.spillCanisters(victim, carried, contactX, contactY);
+        }
+
+        this.collisionEvents.push({
+          x: contactX,
+          y: contactY,
+          force,
+          rammerId: rammer.id,
+          victimId: victim.id,
+          rammerIsPlayer: rammer.player !== null,
+          victimIsPlayer: victim.player !== null,
+          spilled,
+        });
+      }
+    }
+  }
+
+  /** Протаранённому — отлёт: игрока просто отбрасывает, бота ещё и ведёт. */
+  private kickBody(body: CollisionBody, kx: number, ky: number): void {
+    if (body.fixed) return;
+    if (body.bot) {
+      body.bot.kx += kx;
+      body.bot.ky += ky;
+      body.bot.stun = STUN_SECONDS;
+      body.bot.speed *= 0.4;
+      body.bot.angle += (this.rng.next() - 0.5) * 0.9;
+      body.bot.think = 0;
+    } else if (body.player) {
+      body.player.kx += kx;
+      body.player.ky += ky;
+      body.player.speed *= 0.45;
+    }
+  }
+
+  /** Таранившему — отдача: скорость гаснет, но управление остаётся. */
+  private brakeRammer(body: CollisionBody, kx: number, ky: number): void {
+    if (body.fixed) return;
+    if (body.bot) {
+      body.bot.kx += kx;
+      body.bot.ky += ky;
+      body.bot.speed *= 0.55;
+    } else if (body.player) {
+      body.player.kx += kx;
+      body.player.ky += ky;
+      body.player.speed *= 0.6;
+    }
+  }
+
+  /** Канистры протараненной машины разлетаются вокруг места удара. */
+  private spillCanisters(victim: CollisionBody, count: number, x: number, y: number): number {
+    const pool = this.city.canisters.filter((canister) => canister.taken);
+    const drop = Math.min(count, pool.length);
+    if (drop <= 0) return 0;
+    for (let index = 0; index < drop; index += 1) {
+      const canister = pool[index]!;
+      const spot = this.spillSpot(x, y);
+      canister.x = spot.x;
+      canister.y = spot.y;
+      canister.taken = false;
+      canister.cool = CANISTER_COOL;
+    }
+    if (victim.bot) {
+      victim.bot.taken -= drop;
+      victim.bot.gotCanister = victim.bot.taken > 0;
+      victim.bot.think = 0;
+    } else if (victim.player) {
+      // у игрока канистра — это ещё и +10 л к баку, значит бак сдувается обратно
+      victim.player.canisters -= drop;
+      victim.player.tankVolume = Math.max(
+        this.config.startTankVolume,
+        victim.player.tankVolume - drop * this.config.canisterTankBonus,
+      );
+      victim.player.fuel = Math.min(victim.player.fuel, victim.player.tankVolume);
+    }
+    this.objectsDirty = true;
+    return drop;
+  }
+
+  /** Точка для выпавшей канистры: рядом с ударом, но не внутри здания. */
+  private spillSpot(x: number, y: number): { x: number; y: number } {
+    const worldSize = this.city.meta.worldSize;
+    for (let tries = 0; tries < 12; tries += 1) {
+      const angle = this.rng.next() * Math.PI * 2;
+      const radius = SPILL_RADIUS * (0.35 + this.rng.next() * 0.65);
+      const px = clamp(x + Math.cos(angle) * radius, 40, worldSize - 40);
+      const py = clamp(y + Math.sin(angle) * radius, 40, worldSize - 40);
+      const blocked = this.city.buildings.some(
+        (building) =>
+          px > building.x - 6 &&
+          px < building.x + building.w + 6 &&
+          py > building.y - 6 &&
+          py < building.y + building.h + 6,
+      );
+      if (!blocked) return { x: px, y: py };
+    }
+    return { x: clamp(x, 40, worldSize - 40), y: clamp(y, 40, worldSize - 40) };
+  }
+
+  /** Игрок стоит на площадке работающей АЗС — считаем его неподвижной стенкой. */
+  private isAtActiveStation(player: PlayerState): boolean {
+    if (Math.abs(player.speed) > 30) return false;
+    return this.city.stations.some(
+      (station) => station.state === "active" && isInside(player, station),
+    );
+  }
+
   private resolvePlayerCollisions(player: PlayerState): void {
     let collided = false;
     for (const building of this.city.buildings) {
@@ -780,6 +1286,19 @@ function emptyInput(): PlayerInput {
 function publicPlayer(player: PlayerState): PublicPlayerState {
   const { input: _input, lastMoveAt: _lastMoveAt, ...publicState } = player;
   return publicState;
+}
+
+function moveBody(body: CollisionBody, dx: number, dy: number): void {
+  if (!dx && !dy) return;
+  body.x += dx;
+  body.y += dy;
+  if (body.bot) {
+    body.bot.x = body.x;
+    body.bot.y = body.y;
+  } else if (body.player) {
+    body.player.x = body.x;
+    body.player.y = body.y;
+  }
 }
 
 function clamp(value: number, min: number, max: number): number {

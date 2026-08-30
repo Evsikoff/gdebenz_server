@@ -42,6 +42,14 @@ describe("WebSocket protocol validation", () => {
       { type: "player:respawn", payload: { requestId: "respawn-1" } },
       { type: "player:respawn", payload: { requestId: "respawn-1" } },
     ],
+    [
+      { type: "player:booster", payload: { requestId: "boost-1", systemName: "speed25", cost: 1250 } },
+      { type: "player:booster", payload: { requestId: "boost-1", systemName: "speed25", cost: 1250 } },
+    ],
+    [
+      { type: "player:booster", payload: { requestId: "boost-2", systemName: "fuel10l" } },
+      { type: "player:booster", payload: { requestId: "boost-2", systemName: "fuel10l" } },
+    ],
   ])("accepts game event %s", (message, expected) => {
     expect(parseClientMessage(JSON.stringify(message))).toEqual({ ok: true, value: expected });
   });
@@ -52,6 +60,9 @@ describe("WebSocket protocol validation", () => {
     { type: "billboard:interacted", payload: { requestId: "ad-1", billboardId: "" } },
     { type: "player:lost", payload: { requestId: "lost-1", reason: "x".repeat(65) } },
     { type: "player:respawn", payload: {} },
+    { type: "player:booster", payload: { requestId: "boost-3", systemName: "speed 25" } },
+    { type: "player:booster", payload: { requestId: "boost-4", systemName: "speed25", cost: -1 } },
+    { type: "player:booster", payload: { requestId: "boost-5" } },
   ])("rejects invalid game event %s", (message) => {
     expect(parseClientMessage(JSON.stringify(message)).ok).toBe(false);
   });

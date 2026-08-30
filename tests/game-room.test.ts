@@ -289,4 +289,389 @@ describe("GameRoom", () => {
       [room.bots[0]!.name, 8, 3],
     ]);
   });
+
+  it("отбрасывает машины и рассылает событие при таране игрока в бота", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 2 });
+    const player = room.addPlayer("Таран");
+    const bot = room.bots[0]!;
+    for (const other of room.bots.slice(1)) {
+      other.x = 100;
+      other.y = 100;
+      other.speed = 0;
+      other.wait = 999;
+    }
+    const messages: unknown[] = [];
+    room.on("message", (message) => messages.push(message));
+
+    // ставим бота ровно перед носом игрока и разгоняем игрока в него
+    bot.x = player.x + 30;
+    bot.y = player.y;
+    bot.speed = 0;
+    bot.wait = 0;
+    bot.kx = 0;
+    bot.ky = 0;
+    player.angle = 0;
+    player.speed = 500;
+
+    room.step(1 / 30);
+
+    const collision = messages.find(
+      (message) => (message as { type: string }).type === "world:collisions",
+    ) as { payload: { collisions: Array<{ force: number; rammerId: string; victimId: string }> } } | undefined;
+
+    expect(collision).toBeDefined();
+    expect(collision!.payload.collisions).toHaveLength(1);
+    expect(collision!.payload.collisions[0]!.rammerId).toBe(player.id);
+    expect(collision!.payload.collisions[0]!.victimId).toBe(bot.id);
+    expect(collision!.payload.collisions[0]!.force).toBeGreaterThan(0);
+    // протаранённого отбросило и оглушило, таранивший потерял скорость
+    expect(Math.hypot(bot.kx, bot.ky)).toBeGreaterThan(0);
+    expect(bot.stun).toBeGreaterThan(0);
+    expect(player.speed).toBeLessThan(500);
+    // кузова расталкиваются, а не слипаются
+    expect(Math.hypot(bot.x - player.x, bot.y - player.y)).toBeGreaterThan(30);
+  });
+
+  it("выбивает канистры из протаранённого бота", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 2 });
+    const player = room.addPlayer("Таран");
+    const bot = room.bots[0]!;
+    for (const other of room.bots.slice(1)) {
+      other.x = 100;
+      other.y = 100;
+      other.speed = 0;
+      other.wait = 999;
+    }
+    const canister = room.city.canisters[0]!;
+    canister.taken = true;
+    bot.taken = 1;
+    bot.wait = 0;
+
+    bot.x = player.x + 30;
+    bot.y = player.y;
+    bot.speed = 0;
+    player.angle = 0;
+    player.speed = 500;
+
+    room.step(1 / 30);
+
+    expect(bot.taken).toBe(0);
+    expect(canister.taken).toBe(false);
+    expect(canister.cool).toBeGreaterThan(0);
+  });
+
+  it("не считает тараном лёгкое касание бортами", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 2 });
+    const player = room.addPlayer("Сосед");
+    const bot = room.bots[0]!;
+    for (const other of room.bots.slice(1)) {
+      other.x = 100;
+      other.y = 100;
+      other.speed = 0;
+      other.wait = 999;
+    }
+    const messages: unknown[] = [];
+    room.on("message", (message) => messages.push(message));
+
+    // едут рядом в одну сторону и лишь коснулись боками
+    bot.x = player.x;
+    bot.y = player.y + 30;
+    bot.angle = 0;
+    bot.speed = 200;
+    bot.wait = 0;
+    player.angle = 0;
+    player.speed = 200;
+
+    room.step(1 / 30);
+
+    expect(messages.some((message) => (message as { type: string }).type === "world:collisions")).toBe(false);
+    expect(bot.stun).toBe(0);
+  });
+
+  it("сталкивает игроков между собой", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 2 });
+    const first = room.addPlayer("Первый");
+    const second = room.addPlayer("Второй");
+    for (const bot of room.bots) {
+      bot.x = 100;
+      bot.y = 100;
+      bot.speed = 0;
+      bot.wait = 999;
+    }
+    const messages: unknown[] = [];
+    room.on("message", (message) => messages.push(message));
+
+    second.x = first.x + 30;
+    second.y = first.y;
+    second.speed = 0;
+    first.angle = 0;
+    first.speed = 500;
+
+    room.step(1 / 30);
+
+    const collision = messages.find(
+      (message) => (message as { type: string }).type === "world:collisions",
+    ) as { payload: { collisions: Array<{ rammerId: string; victimId: string; victimIsPlayer: boolean }> } } | undefined;
+
+    expect(collision).toBeDefined();
+    expect(collision!.payload.collisions[0]!.rammerId).toBe(first.id);
+    expect(collision!.payload.collisions[0]!.victimId).toBe(second.id);
+    expect(collision!.payload.collisions[0]!.victimIsPlayer).toBe(true);
+    expect(Math.hypot(second.kx, second.ky)).toBeGreaterThan(0);
+  });
+
+  it("выбивает канистры из протаранённого игрока и возвращает объём бака", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 2 });
+    const first = room.addPlayer("Первый");
+    const second = room.addPlayer("Второй");
+    for (const bot of room.bots) {
+      bot.x = 100;
+      bot.y = 100;
+      bot.speed = 0;
+      bot.wait = 999;
+    }
+    const canister = room.city.canisters[0]!;
+    canister.taken = true;
+    second.canisters = 1;
+    second.tankVolume = CONFIG.startTankVolume + CONFIG.canisterTankBonus;
+    second.fuel = second.tankVolume;
+
+    second.x = first.x + 30;
+    second.y = first.y;
+    second.speed = 0;
+    first.angle = 0;
+    first.speed = 500;
+
+    room.step(1 / 30);
+
+    expect(second.canisters).toBe(0);
+    expect(second.tankVolume).toBe(CONFIG.startTankVolume);
+    expect(second.fuel).toBeLessThanOrEqual(CONFIG.startTankVolume);
+    expect(canister.taken).toBe(false);
+  });
+
+  it("заправляет постепенно, а не мгновенно", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 0 });
+    const player = room.addPlayer("Заправщик");
+    const station = room.city.stations.find((value) => value.state === "active")!;
+    station.limit = null;
+    station.price = 100;
+    player.money = 1_000_000;
+    player.fuel = 0.5;
+    player.x = station.x + station.w / 2;
+    player.y = station.y + station.h / 2;
+    player.speed = 0;
+
+    room.step(1 / 30);
+    const afterFirstTick = player.fuel;
+
+    // за один тик наливается не больше refuelRate * dt
+    expect(afterFirstTick).toBeGreaterThan(0.5);
+    expect(afterFirstTick - 0.5).toBeLessThanOrEqual(CONFIG.refuelRate / 30 + 0.001);
+    expect(player.refueling).toBe(true);
+    expect(player.refuelStationId).toBe(station.id);
+    // колонка блокируется сразу, как только к ней встали
+    expect(station.state).toBe("locked");
+    // под колонкой машина стоит
+    expect(player.speed).toBe(0);
+
+    // полный бак набирается примерно за tankVolume / refuelRate секунд
+    let ticks = 1;
+    while (player.refueling && ticks < 30 * 60) {
+      room.step(1 / 30);
+      ticks += 1;
+    }
+    const expectedTicks = ((player.tankVolume - 0.5) / CONFIG.refuelRate) * 30;
+    expect(ticks).toBeGreaterThan(expectedTicks * 0.9);
+    expect(player.fuel).toBeCloseTo(player.tankVolume, 3);
+    expect(player.refuelSpent).toBeCloseTo(player.refuelLiters * station.price, 3);
+  });
+
+  it("останавливает заправку на лимите колонки", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 0 });
+    const player = room.addPlayer("Лимит");
+    const station = room.city.stations.find((value) => value.state === "active")!;
+    station.limit = 5;
+    station.price = 1;
+    player.money = 1_000_000;
+    player.fuel = 0.01;
+    player.x = station.x + station.w / 2;
+    player.y = station.y + station.h / 2;
+
+    const stops: Array<{ reason: string | null; liters: number }> = [];
+    room.on("message", (message) => {
+      const typed = message as { type: string; payload: { state?: string; reason: string | null; liters: number } };
+      if (typed.type === "player:refuel" && typed.payload.state === "stopped") {
+        stops.push({ reason: typed.payload.reason, liters: typed.payload.liters });
+      }
+    });
+
+    for (let i = 0; i < 30 * 5 && stops.length === 0; i += 1) room.step(1 / 30);
+
+    expect(stops).toHaveLength(1);
+    expect(stops[0]!.reason).toBe("limit");
+    expect(stops[0]!.liters).toBeCloseTo(5, 2);
+    expect(player.refueling).toBe(false);
+    // повторно встать под ту же колонку, не съехав, нельзя
+    expect(player.usedStationId).toBe(station.id);
+    room.step(1 / 30);
+    expect(player.refueling).toBe(false);
+  });
+
+  it("останавливает заправку, когда кончились деньги", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 0 });
+    const player = room.addPlayer("Безденежье");
+    const station = room.city.stations.find((value) => value.state === "active")!;
+    station.limit = null;
+    station.price = 100;
+    player.money = 200;
+    player.fuel = 0.01;
+    player.x = station.x + station.w / 2;
+    player.y = station.y + station.h / 2;
+
+    const stops: string[] = [];
+    room.on("message", (message) => {
+      const typed = message as { type: string; payload: { state?: string; reason: string | null } };
+      if (typed.type === "player:refuel" && typed.payload.state === "stopped" && typed.payload.reason) {
+        stops.push(typed.payload.reason);
+      }
+    });
+
+    for (let i = 0; i < 30 * 5 && stops.length === 0; i += 1) room.step(1 / 30);
+
+    expect(stops[0]).toBe("money");
+    expect(player.money).toBeLessThan(1);
+    expect(player.fuel).toBeCloseTo(2, 0);
+  });
+
+  it("бустер открывает именно ту АЗС, у которой стоит игрок", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 0 });
+    const player = room.addPlayer("Реклама");
+    const locked = room.city.stations.find((value) => value.state === "locked")!;
+    player.x = locked.x + locked.w / 2;
+    player.y = locked.y + locked.h / 2;
+
+    const result = room.interact(player.id, {
+      requestId: "r1",
+      objectType: "station",
+      objectId: locked.id,
+    }) as { payload: { ok: boolean; details?: Record<string, unknown> } };
+
+    expect(result.payload.ok).toBe(true);
+    expect(result.payload.details?.activated).toBe(true);
+    expect(result.payload.details?.stationId).toBe(locked.id);
+    expect(locked.state).toBe("active");
+    expect(locked.origin).toBe("ad");
+  });
+
+  it("не открывает АЗС, до которой игрок не доехал", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 0 });
+    const player = room.addPlayer("Далеко");
+    const locked = room.city.stations.find((value) => value.state === "locked")!;
+    player.x = locked.x + 5_000;
+    player.y = locked.y + 5_000;
+
+    const result = room.interact(player.id, {
+      requestId: "r2",
+      objectType: "station",
+      objectId: locked.id,
+    }) as { payload: { ok: boolean; code: string } };
+
+    expect(result.payload.ok).toBe(false);
+    expect(result.payload.code).toBe("too-far");
+    expect(locked.state).toBe("locked");
+  });
+
+  it("применяет бустеры на сервере и списывает за них деньги", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 0 });
+    const player = room.addPlayer("Бустеры");
+    const money = player.money;
+
+    const speed = room.reportBooster(player.id, "b1", "speed25", 500);
+    expect(speed.payload.ok).toBe(true);
+    expect(player.speedMultiplier).toBeCloseTo(1.25, 5);
+    expect(player.money).toBe(money - 500);
+
+    const consumption = room.reportBooster(player.id, "b2", "consumption35", 0);
+    expect(consumption.payload.ok).toBe(true);
+    expect(player.fuelConsumptionMultiplier).toBeCloseTo(0.65, 5);
+
+    const cash = room.reportBooster(player.id, "b3", "money0.5", 0);
+    expect(cash.payload.ok).toBe(true);
+    expect(player.money).toBe(money - 500 + Math.floor(CONFIG.startMoney * 0.5));
+
+    // повторный запрос с тем же requestId ничего не начисляет второй раз
+    const balance = player.money;
+    room.reportBooster(player.id, "b3", "money0.5", 0);
+    expect(player.money).toBe(balance);
+
+    expect(room.reportBooster(player.id, "b4", "teleport", 0).payload.ok).toBe(false);
+  });
+
+  it("бустер топлива поднимает заглохшего игрока", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 0 });
+    const player = room.addPlayer("Заглох");
+    player.fuel = 0;
+    room.reportPlayerLost(player.id, "lost1", "fuel-empty");
+    expect(player.status).toBe("lost");
+
+    const result = room.reportBooster(player.id, "b5", "fuel10l", 0);
+
+    expect(result.payload.ok).toBe(true);
+    expect(result.payload.details?.revived).toBe(true);
+    expect(player.status).toBe("active");
+    expect(player.fuel).toBeCloseTo(10, 5);
+  });
+
+  it("бустер скорости поднимает потолок скорости в симуляции", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 0 });
+    const plain = room.addPlayer("Обычный");
+    const boosted = room.addPlayer("Быстрый");
+    room.reportBooster(boosted.id, "b6", "speed25", 0);
+
+    // потолок скорости срезается в stepPlayer, поэтому достаточно одного тика
+    for (const player of [plain, boosted]) {
+      player.fuel = 50;
+      player.speed = CONFIG.maxSpeed * 4;
+      room.setInput(player.id, {
+        up: true,
+        down: false,
+        left: false,
+        right: false,
+        handbrake: false,
+        seq: 1,
+        worldRevision: room.revision,
+      });
+    }
+    room.step(1 / 30);
+
+    expect(plain.speed).toBeLessThanOrEqual(CONFIG.maxSpeed + 0.001);
+    expect(boosted.speed).toBeGreaterThan(CONFIG.maxSpeed);
+    expect(boosted.speed).toBeLessThanOrEqual(CONFIG.maxSpeed * 1.25 + 0.001);
+  });
+
+  it("бустер расхода экономит топливо", () => {
+    const room = new GameRoom({ ...smallRoomConfig, botCount: 0 });
+    const plain = room.addPlayer("Обычный");
+    const boosted = room.addPlayer("Экономный");
+    room.reportBooster(boosted.id, "b7", "consumption35", 0);
+
+    for (const player of [plain, boosted]) player.fuel = 50;
+    for (let i = 0; i < 30; i += 1) {
+      for (const player of [plain, boosted]) {
+        room.setInput(player.id, {
+          up: true,
+          down: false,
+          left: false,
+          right: false,
+          handbrake: false,
+          seq: i + 1,
+          worldRevision: room.revision,
+        });
+      }
+      room.step(1 / 30);
+    }
+
+    expect(50 - boosted.fuel).toBeLessThan(50 - plain.fuel);
+  });
 });

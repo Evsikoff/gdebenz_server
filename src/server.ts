@@ -188,6 +188,18 @@ export function createGameServer(options: GameServerOptions = {}): RunningGameSe
         send(session, room.reportPlayerLost(session.playerId, message.payload.requestId, message.payload.reason));
         return;
       }
+      if (message.type === "player:booster") {
+        send(
+          session,
+          room.reportBooster(
+            session.playerId,
+            message.payload.requestId,
+            message.payload.systemName,
+            message.payload.cost,
+          ),
+        );
+        return;
+      }
       if (message.type === "player:respawn") {
         send(session, room.respawnPlayer(session.playerId, message.payload.requestId));
       }

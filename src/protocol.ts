@@ -1,4 +1,12 @@
-import type { City, EntitySnapshot, LeaderboardEntry, PlayerInput, PublicPlayerState } from "./types.js";
+import type {
+  City,
+  CollisionEvent,
+  EntitySnapshot,
+  LeaderboardEntry,
+  PlayerInput,
+  PublicPlayerState,
+  RefuelEvent,
+} from "./types.js";
 
 export const PROTOCOL_VERSION = 1 as const;
 
@@ -28,6 +36,10 @@ export type ClientMessage =
       payload: { requestId: string; billboardId: string };
     }
   | {
+      type: "player:booster";
+      payload: { requestId: string; systemName: string; cost?: number };
+    }
+  | {
       type: "player:lost";
       payload: { requestId: string; reason?: string };
     }
@@ -49,6 +61,8 @@ export type ServerMessage =
       payload: { map: City; reason: "player-count"; fuelBonus: number; affectedPlayers: string[] };
     }
   | { type: "world:entities"; payload: EntitySnapshot }
+  | { type: "world:collisions"; payload: { tick: number; collisions: CollisionEvent[] } }
+  | { type: "player:refuel"; payload: RefuelEvent }
   | { type: "world:objects"; payload: { worldRevision: number; stations: City["stations"]; billboards: City["billboards"]; canisters: City["canisters"] } }
   | { type: "player:joined"; payload: { player: PublicPlayerState; botCount: number } }
   | { type: "player:left"; payload: { playerId: string; botCount: number } }
@@ -63,7 +77,13 @@ export type ServerMessage =
       type: "game:event-result";
       payload: {
         requestId: string;
-        event: "fuel-filled" | "station-blocked" | "billboard-interacted" | "player-lost" | "player-respawn";
+        event:
+          | "fuel-filled"
+          | "station-blocked"
+          | "billboard-interacted"
+          | "player-lost"
+          | "player-respawn"
+          | "booster-applied";
         ok: boolean;
         code: string;
         player: PublicPlayerState;
@@ -199,6 +219,22 @@ export function parseClientMessage(raw: string): { ok: true; value: ClientMessag
       return requestId && billboardId
         ? { ok: true, value: { type: decoded.type, payload: { requestId, billboardId } } }
         : { ok: false, error: "Invalid billboard-interacted event" };
+    }
+    case "player:booster": {
+      const requestId = requiredString(payload, "requestId", 64);
+      const systemName = requiredString(payload, "systemName", 64);
+      if (!requestId || !systemName || !/^[a-z0-9_.]+$/i.test(systemName)) {
+        return { ok: false, error: "Invalid booster event" };
+      }
+      if (payload.cost !== undefined && (!isFiniteNumber(payload.cost) || payload.cost < 0)) {
+        return { ok: false, error: "Invalid booster cost" };
+      }
+      const boosterPayload: Extract<ClientMessage, { type: "player:booster" }>["payload"] = {
+        requestId,
+        systemName,
+      };
+      if (typeof payload.cost === "number") boosterPayload.cost = payload.cost;
+      return { ok: true, value: { type: decoded.type, payload: boosterPayload } };
     }
     case "player:lost": {
       const requestId = requiredString(payload, "requestId", 64);

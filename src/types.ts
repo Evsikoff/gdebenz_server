@@ -130,6 +130,27 @@ export interface PlayerState extends Point {
   input: PlayerInput;
   lastInputSeq: number;
   lastMoveAt: number;
+  /** Накопленный отскок после тарана, пикс/с. Гасится каждый тик. */
+  kx: number;
+  ky: number;
+  /** Идёт заправка: машина стоит под колонкой и топливо льётся по refuelRate. */
+  refueling: boolean;
+  /** Колонка, под которой идёт заправка. */
+  refuelStationId: string | null;
+  /** Сколько литров уже налито в текущей сессии — против лимита колонки. */
+  refuelLiters: number;
+  /** Сколько рублей уже отдано в текущей сессии. */
+  refuelSpent: number;
+  /**
+   * Площадка, с которой машина ещё не съехала после заправки. Пока стоим на
+   * ней, заправку заново не начать: иначе долитый бак тратил бы пару капель и
+   * колонка блокировалась бы навсегда.
+   */
+  usedStationId: string | null;
+  /** Множитель максимальной скорости от бустеров: 1 — без бустера. */
+  speedMultiplier: number;
+  /** Множитель расхода топлива от бустеров: 1 — без бустера, меньше — экономнее. */
+  fuelConsumptionMultiplier: number;
 }
 
 export type BotPlan = "station" | "canister";
@@ -151,6 +172,11 @@ export interface BotState extends Point {
   style: number;
   lane: number;
   wobble: number;
+  /** Накопленный отскок после тарана, пикс/с. Гасится каждый тик. */
+  kx: number;
+  ky: number;
+  /** Пока > 0, бот после удара не слушается руля. */
+  stun: number;
 }
 
 export type BotGoal =
@@ -160,6 +186,49 @@ export type BotGoal =
   | { kind: "wander"; x: number; y: number };
 
 export interface PublicPlayerState extends Omit<PlayerState, "input" | "lastMoveAt"> {}
+
+/** Что бустер сделал с игроком — клиенту, чтобы показать результат. */
+export interface BoosterEffect {
+  systemName: string;
+  /** Машина завелась заново: заглохшему долили топлива. */
+  revived: boolean;
+  speedMultiplier: number;
+  fuelConsumptionMultiplier: number;
+}
+
+/**
+ * Заправка началась или закончилась. Клиент по этому событию даёт звук
+ * колонки, конфетти на полном баке и сообщает, почему заправка прервалась.
+ */
+export interface RefuelEvent {
+  playerId: string;
+  stationId: string;
+  state: "started" | "stopped";
+  /** Почему заправка закончилась: бак полон, лимит колонки, деньги или отъезд. */
+  reason: "full" | "limit" | "money" | "left" | null;
+  /** Итог сессии: сколько налито и на сколько рублей. */
+  liters: number;
+  spent: number;
+}
+
+/**
+ * Столкновение двух машин: сервер считает его сам и рассылает клиентам,
+ * чтобы те нарисовали искры, тряхнули камеру и дали звук удара.
+ */
+export interface CollisionEvent {
+  /** Точка касания кузовов в мировых координатах. */
+  x: number;
+  y: number;
+  /** Сила удара — та же величина, что уходит в отскок. */
+  force: number;
+  /** Кто протаранил и кого: id игрока или бота. */
+  rammerId: string;
+  victimId: string;
+  rammerIsPlayer: boolean;
+  victimIsPlayer: boolean;
+  /** Сколько канистр выбило из протаранённой машины. */
+  spilled: number;
+}
 
 export interface LeaderboardEntry {
   entityId: string;
