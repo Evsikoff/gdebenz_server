@@ -29,6 +29,26 @@ describe("GameRoom", () => {
     expect({ x: room.bots.at(-1)!.x, y: room.bots.at(-1)!.y }).not.toEqual(removedBotSpawn);
   });
 
+  it("returns cargo from a removed bot and adds a canister for a new player", () => {
+    const room = new GameRoom(smallRoomConfig);
+    const removedBot = room.bots.at(-1)!;
+    const carried = room.city.canisters[0]!;
+    carried.taken = true;
+    removedBot.taken = 1;
+    removedBot.tankVolume += smallRoomConfig.canisterTankBonus;
+    const initialTotal = room.city.canisters.length;
+    const initialFree = room.city.canisters.filter((canister) => !canister.taken).length;
+
+    room.addPlayer("Новичок");
+
+    expect(room.botCount).toBe(smallRoomConfig.botCount - 1);
+    expect(room.city.canisters).toHaveLength(initialTotal + 1);
+    expect(room.city.canisters.filter((canister) => !canister.taken)).toHaveLength(initialFree + 2);
+    expect(carried).toMatchObject({ taken: false });
+    expect(carried.cool).toBeGreaterThan(0);
+    expect(room.city.canisters.at(-1)).toMatchObject({ taken: false, cool: 0 });
+  });
+
   it("spawns players at different random road locations", () => {
     const room = new GameRoom({ ...smallRoomConfig, botCount: 10 });
     const players = [room.addPlayer("Первый"), room.addPlayer("Второй"), room.addPlayer("Третий")];
@@ -243,12 +263,17 @@ describe("GameRoom", () => {
     player.fuel = 7;
     player.tankVolume = 80;
     player.money = 300;
+    const carried = room.city.canisters.slice(0, 3);
+    for (const canister of carried) canister.taken = true;
     player.canisters = 3;
     player.filledLiters = 12;
 
     const lost = room.reportPlayerLost(player.id, "lost-1", "out-of-fuel");
     expect(lost.payload).toMatchObject({ event: "player-lost", ok: true, details: { reason: "out-of-fuel" } });
     expect(player.status).toBe("lost");
+    expect(player.canisters).toBe(0);
+    expect(player.tankVolume).toBe(eventRoomConfig.startTankVolume);
+    expect(carried.every((canister) => !canister.taken && canister.cool > 0)).toBe(true);
     expect(room.entitySnapshot().players).toHaveLength(0);
     expect(room.leaderboard().find((row) => row.entityId === player.id)).toMatchObject({ liters: 12, active: false });
     expect(
@@ -312,6 +337,8 @@ describe("GameRoom", () => {
     bot.fuel = 0.001;
     bot.money = 0;
     bot.tankVolume = 70;
+    const carried = room.city.canisters.slice(0, 2);
+    for (const canister of carried) canister.taken = true;
     bot.taken = 2;
     bot.filledLiters = 12;
     bot.aggroCd = 999;
@@ -320,6 +347,9 @@ describe("GameRoom", () => {
 
     expect(bot.status).toBe("lost");
     expect(bot.fuel).toBe(0);
+    expect(bot.taken).toBe(0);
+    expect(bot.tankVolume).toBe(config.startTankVolume);
+    expect(carried.every((canister) => !canister.taken && canister.cool > 0)).toBe(true);
     expect(bot.respawnRemaining).toBeCloseTo(config.botRespawnDelay, 5);
     expect(room.entitySnapshot().bots).toHaveLength(0);
     expect(room.leaderboard().find((row) => row.entityId === bot.id)).toMatchObject({ active: false, liters: 12 });

@@ -187,6 +187,7 @@ export class GameRoom extends EventEmitter {
       player.y = newSpawn.y;
       player.angle = newSpawn.angle;
     }
+    this.spawnCanister();
 
     this.emitMessage({
       type: "player:joined",
@@ -197,7 +198,12 @@ export class GameRoom extends EventEmitter {
   }
 
   removePlayer(playerId: string): boolean {
-    if (!this.players.delete(playerId)) return false;
+    const player = this.players.get(playerId);
+    if (!player) return false;
+    if (player.canisters > 0) {
+      this.dropCanisters({ player, bot: null }, player.canisters, player.x, player.y);
+    }
+    this.players.delete(playerId);
     this.eventResults.delete(playerId);
     this.refuelSessions.delete(playerId);
     this.refuelPlans.delete(playerId);
@@ -417,6 +423,9 @@ export class GameRoom extends EventEmitter {
   reportPlayerLost(playerId: string, requestId: string, reason = "game-over"): GameEventResult {
     return this.processGameEvent(playerId, requestId, "player-lost", (player) => {
       if (player.status === "lost") return { ok: false, code: "already-lost" };
+      if (player.canisters > 0) {
+        this.dropCanisters({ player, bot: null }, player.canisters, player.x, player.y);
+      }
       player.status = "lost";
       player.speed = 0;
       player.input = emptyInput();
@@ -720,7 +729,14 @@ export class GameRoom extends EventEmitter {
 
   private reconcileBots(): void {
     const target = botCountForPlayers(this.players.size, this.config);
-    if (this.bots.length > target) this.bots.splice(target);
+    if (this.bots.length > target) {
+      const removed = this.bots.splice(target);
+      for (const bot of removed) {
+        if (bot.taken > 0) {
+          this.dropCanisters({ player: null, bot }, bot.taken, bot.x, bot.y);
+        }
+      }
+    }
     while (this.bots.length < target) {
       const occupied = [
         ...this.bots,
@@ -1029,6 +1045,9 @@ export class GameRoom extends EventEmitter {
 
       const result = stepBot(bot, this.city, dt, players, this.rng, this.config);
       if (result.lost) {
+        if (bot.taken > 0) {
+          this.dropCanisters({ player: null, bot }, bot.taken, bot.x, bot.y);
+        }
         leaderboardChanged = true;
         continue;
       }
@@ -1060,6 +1079,24 @@ export class GameRoom extends EventEmitter {
         this.takeCanister(player, canister.id);
       }
     }
+  }
+
+  /** Каждый новый живой игрок добавляет на карту ещё одну доступную канистру. */
+  private spawnCanister(): void {
+    const occupied = [
+      ...this.city.canisters.filter((canister) => !canister.taken),
+      ...this.bots.filter((bot) => bot.status === "active"),
+      ...[...this.players.values()].filter((player) => player.status === "active"),
+    ];
+    const spawn = getRandomSpawn(this.city, this.rng, occupied, 120);
+    this.city.canisters.push({ id: this.nextCanisterId(), x: spawn.x, y: spawn.y, taken: false, cool: 0 });
+    this.objectsDirty = true;
+  }
+
+  private nextCanisterId(): string {
+    let index = this.city.canisters.length;
+    while (this.city.canisters.some((canister) => canister.id === `canister:${index}`)) index += 1;
+    return `canister:${index}`;
   }
 
   private takeStation(station: Station, canisters: number): StationLockResult {
@@ -1220,7 +1257,7 @@ export class GameRoom extends EventEmitter {
         if (!victim.fixed) {
           this.kickBody(victim, dirX * force, dirY * force);
           const carried = victim.bot ? victim.bot.taken : victim.player?.canisters ?? 0;
-          if (carried > 0) spilled = this.spillCanisters(victim, carried, contactX, contactY);
+          if (carried > 0) spilled = this.dropCanisters(victim, carried, contactX, contactY);
         }
 
         this.collisionEvents.push({
@@ -1268,14 +1305,29 @@ export class GameRoom extends EventEmitter {
     }
   }
 
-  /** Канистры протараненной машины разлетаются вокруг места удара. */
-  private spillCanisters(victim: CollisionBody, count: number, x: number, y: number): number {
+  /** Возвращает груз исчезающей или протараненной машины обратно на карту. */
+  private dropCanisters(
+    victim: Pick<CollisionBody, "player" | "bot">,
+    count: number,
+    x: number,
+    y: number,
+  ): number {
     const pool = this.city.canisters.filter((canister) => canister.taken);
-    const drop = Math.min(count, pool.length);
+    const drop = Math.max(0, Math.floor(count));
     if (drop <= 0) return 0;
     for (let index = 0; index < drop; index += 1) {
-      const canister = pool[index]!;
       const spot = this.spillSpot(x, y);
+      const canister = pool[index];
+      if (!canister) {
+        this.city.canisters.push({
+          id: this.nextCanisterId(),
+          x: spot.x,
+          y: spot.y,
+          taken: false,
+          cool: CANISTER_COOL,
+        });
+        continue;
+      }
       canister.x = spot.x;
       canister.y = spot.y;
       canister.taken = false;

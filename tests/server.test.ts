@@ -1,6 +1,7 @@
 import { once } from "node:events";
 import WebSocket from "ws";
 import { describe, expect, it } from "vitest";
+import { CONFIG } from "../src/config.js";
 import { createGameServer } from "../src/server.js";
 
 describe("WebSocket server", () => {
@@ -21,6 +22,7 @@ describe("WebSocket server", () => {
     expect(welcome.payload.player.name).toBe("Сетевой игрок");
     expect(snapshot.payload.entities.players).toHaveLength(1);
     expect(snapshot.payload.entities.bots).toHaveLength(9);
+    expect(snapshot.payload.map.canisters).toHaveLength(CONFIG.canistersPerBaseMap + 1);
     expect(snapshot.payload.map.base.id).toBe("base");
     expect(snapshot.payload.leaderboard).toHaveLength(10);
 
